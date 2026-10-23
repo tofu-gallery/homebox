@@ -95,4 +95,12 @@ if [ -n "${DATABASE_URL:-}" ]; then
 	esac
 fi
 
+# Homebox refuses to start without a 32-byte pepper for API keys. Tofu does not supply one; derive it from the
+# database URL so a copy starts without the owner having to set anything. Changing DATABASE_URL (for example after a
+# database restore) invalidates API keys but leaves sign-in sessions alone. An owner-set pepper always wins.
+if [ -z "${HBOX_AUTH_API_KEY_PEPPER:-}" ] && [ -n "${DATABASE_URL:-}" ]; then
+  HBOX_AUTH_API_KEY_PEPPER=$(printf '%s' "homebox-api-key-pepper:${DATABASE_URL}" | sha256sum | cut -d' ' -f1)
+  export HBOX_AUTH_API_KEY_PEPPER
+fi
+
 exec /app/api "$@"
