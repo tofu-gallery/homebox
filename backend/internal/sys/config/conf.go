@@ -143,6 +143,10 @@ type Options struct {
 	AllowAnalytics       bool   `yaml:"allow_analytics"         conf:"default:false"`
 	AllowLocalLogin      bool   `yaml:"allow_local_login"       conf:"default:true"`
 	TrustProxy           bool   `yaml:"trust_proxy"             conf:"default:false"`
+	// Tofu (2026-10-23): HBOX_OPTIONS_SOURCE_URL is where this copy's own source code is published. When set, the
+	// sign-in page's GitHub link and the footer point there instead of upstream, as AGPL-3.0 section 13 asks of a
+	// modified copy that people use over a network. Empty keeps upstream's links.
+	SourceURL string `yaml:"source_url"`
 }
 
 type Thumbnail struct {

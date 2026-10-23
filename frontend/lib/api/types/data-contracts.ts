@@ -1348,6 +1348,8 @@ export interface APISummary {
   latest: Latest;
   message: string;
   oidc: OIDCStatus;
+  /** Tofu (2026-10-23): HBOX_OPTIONS_SOURCE_URL, the address of this copy's source code; absent when unset. */
+  sourceUrl?: string;
   telemetry: TelemetryStatus;
   title: string;
   versions: string[];

@@ -74,6 +74,8 @@ ENV HBOX_DATABASE_SQLITE_PATH=/data/homebox.db?_pragma=busy_timeout=2000&_pragma
 # Tofu (2026-10-23): thumbnails and the hourly GitHub release check are off by default on Tofu
 ENV HBOX_THUMBNAIL_ENABLED=false
 ENV HBOX_OPTIONS_GITHUB_RELEASE_CHECK=false
+# Tofu (2026-10-23): the sign-in page and footer link to the exact source this image is built from (AGPL-3.0 section 13)
+ENV HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-23.1
 
 # Install necessary runtime dependencies
 RUN apk --no-cache add ca-certificates wget mosquitto-clients && \

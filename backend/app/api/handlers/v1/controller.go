@@ -130,6 +130,8 @@ type (
 		LabelPrinting     bool            `json:"labelPrinting"`
 		OIDC              OIDCStatus      `json:"oidc"`
 		Telemetry         TelemetryStatus `json:"telemetry"`
+		// Tofu (2026-10-23): HBOX_OPTIONS_SOURCE_URL, the address of this copy's source code; empty when unset.
+		SourceURL string `json:"sourceUrl,omitempty"`
 	}
 
 	OIDCStatus struct {
@@ -201,6 +203,7 @@ func (ctrl *V1Controller) HandleBase(ready ReadyFunc, build Build) errchain.Hand
 			Telemetry: TelemetryStatus{
 				Enabled: ctrl.config.Otel.Enabled,
 			},
+			SourceURL: ctrl.config.Options.SourceURL,
 		})
 	}
 }

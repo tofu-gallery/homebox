@@ -264,7 +264,12 @@
           <div class="z-10 ml-auto mt-6 flex items-center gap-4 sm:mt-0">
             <Tooltip>
               <TooltipTrigger as-child>
-                <a href="https://github.com/sysadminsmedia/homebox" target="_blank" rel="noopener noreferrer">
+                <!-- Tofu (2026-10-23): links to HBOX_OPTIONS_SOURCE_URL, this copy's own source code, when it is set -->
+                <a
+                  :href="status?.sourceUrl || 'https://github.com/sysadminsmedia/homebox'"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
                   <MdiGithub class="size-8" />
                 </a>
               </TooltipTrigger>

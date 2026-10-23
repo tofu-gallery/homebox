@@ -214,7 +214,12 @@
 
           <footer v-if="status" class="bottom-0 w-full pb-4 text-center">
             <p class="text-center text-sm">
+              <!-- Tofu (2026-10-23): with HBOX_OPTIONS_SOURCE_URL set, the footer links to this copy's own source code -->
+              <a v-if="status.sourceUrl" :href="status.sourceUrl" target="_blank" rel="noopener noreferrer">
+                {{ $t("global.github") }}
+              </a>
               <span
+                v-else
                 v-html="
                   DOMPurify.sanitize(
                     $t('global.footer.version_link', {
