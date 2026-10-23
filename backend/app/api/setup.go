@@ -138,6 +138,11 @@ func setupDatabaseURL(cfg *config.Config) (string, error) {
 		}
 	case config.DriverPostgres:
 		databaseURL = fmt.Sprintf("host=%s port=%s dbname=%s sslmode=%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.Database, cfg.Database.SslMode)
+		// Tofu (2026-10-23): Tofu's DATABASE_URL is a transaction pooler, which keeps no named prepared
+		// statements, so run every query on the unnamed statement instead of pgx's named-statement cache.
+		if os.Getenv("DATABASE_URL") != "" {
+			databaseURL += " default_query_exec_mode=cache_describe"
+		}
 		if cfg.Database.Username != "" {
 			databaseURL += fmt.Sprintf(" user=%s", cfg.Database.Username)
 		}
