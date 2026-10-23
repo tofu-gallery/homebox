@@ -3,7 +3,7 @@
 This repository is Tofu's copy of **sysadminsmedia/homebox** (licence: AGPL-3.0), listed in Tofu's app gallery as **Homebox**: a home inventory app for recording what you own, where it is kept, its receipts, warranties and maintenance.
 
 - `main` mirrors the upstream repository and is never committed to by Tofu.
-- `tofu` carries Tofu's own changes; tags named `pin/<date>` mark the versions the gallery points to. The current pin is `pin/2026-10-23.1`.
+- `tofu` carries Tofu's own changes; tags named `pin/<date>` mark the versions the gallery points to. The current pin is `pin/2026-10-23.2`.
 - A visitor who chooses this app gets a private snapshot of the pinned version in their own Tofu account. Their copy does not follow upstream updates.
 - Upstream: https://github.com/sysadminsmedia/homebox at `1fd28822634a3d5935c002d569559ef46530d4a0` (2026-10-17, v0.27.0 plus one commit).
 
@@ -23,7 +23,7 @@ This repository is Tofu's copy of **sysadminsmedia/homebox** (licence: AGPL-3.0)
 - `Dockerfile`:
   - `ENTRYPOINT` is now `/bin/sh /app/tofu-entrypoint.sh`, and the script is copied into the image. The `CMD` is unchanged.
   - `HBOX_THUMBNAIL_ENABLED=false` and `HBOX_OPTIONS_GITHUB_RELEASE_CHECK=false` are now image defaults, and the owner can set either back to `true`. Thumbnails cost image processing for photos that are lost on restart anyway (see below). The release check calls GitHub every hour to show an update notice, but this copy is a fixed snapshot.
-  - `HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-23.1` is an image default: the address of this copy's exact source (see "Licence and source code").
+  - `HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-23.2` is an image default: the address of this copy's exact source (see "Licence and source code").
   - `HEALTHCHECK` checks the port the server actually listens on (`PORT`, then `HBOX_WEB_PORT`, then 7745), not a fixed 7745.
 - `backend/app/api/setup.go`: when `DATABASE_URL` is set, the Postgres connection adds `default_query_exec_mode=cache_describe`. Tofu's `DATABASE_URL` goes through a transaction pooler, which keeps no named prepared statements, and those are pgx's default. With this mode, every query runs on the unnamed statement.
 - A source link the copy can point at its own code, for AGPL-3.0 section 13:
@@ -33,6 +33,7 @@ This repository is Tofu's copy of **sysadminsmedia/homebox** (licence: AGPL-3.0)
   - `frontend/layouts/default.vue`: the footer of every signed-in page shows a "GitHub Project" link to that address instead of upstream's "Version: … Build: …" release link.
   - `frontend/lib/api/types/data-contracts.ts` declares the field. That file and the API docs under `backend/app/api/static/docs` are generated upstream; the docs were not regenerated, so they do not list `sourceUrl`.
   - With `HBOX_OPTIONS_SOURCE_URL` empty, every link is exactly as upstream has it.
+- `.gitlab-ci.yml` (removed in `pin/2026-10-23.2`). This is upstream's GitLab pipeline: it tests, builds and releases Homebox on upstream's GitLab, and it installs its tools by running scripts it downloads (`sh -c "$(curl …)"` and `curl … | bash`). Tofu's safety check blocks a site or app that contains such a file (five `clone-execution` findings, "GitLab CI configuration runs code downloaded from the network"), so it stopped a deploy of `pin/2026-10-23.1` and `pin/2026-10-23`. A copy never runs upstream's pipeline, and nothing else in the repository refers to the file. The file holds no licence or copyright notice. Upstream's GitHub Actions workflows under `.github/workflows/` stay, because the check has no finding on them. `.devcontainer/Dockerfile` has the same install-by-download line for the Task tool; the check does not flag it, so it stays too.
 
 ## The API key pepper
 
@@ -65,11 +66,11 @@ Homebox stores each API key as an HMAC keyed with `HBOX_AUTH_API_KEY_PEPPER`. Si
 
 ## Licence and source code
 
-- AGPL-3.0. `LICENSE` and every copyright notice stay exactly as upstream has them. Every file Tofu changes carries a dated `Tofu (2026-10-23)` note at the change, and `tofu-entrypoint.sh` is Tofu's own file.
+- AGPL-3.0. `LICENSE` and every copyright notice stay exactly as upstream has them. Every file Tofu changes carries a dated `Tofu (2026-10-23)` note at the change, and `tofu-entrypoint.sh` is Tofu's own file. The only file Tofu removed is upstream's `.gitlab-ci.yml` (see "What Tofu changes").
 - The Homebox name and logo belong to the upstream project; the gallery uses them only to say which app this is. `backend/internal/core/currencies/currencies.json` is upstream's bundled currency list. No fonts are bundled.
 - **Source offer (AGPL-3.0 section 13).** A modified copy that people use over a network has to offer them its own source code.
   - What a copy of the earlier pin, `pin/2026-10-23`, shows: the sign-in page's GitHub icon opens upstream's repository, https://github.com/sysadminsmedia/homebox, and the signed-in footer links "Version: … Build: …" to an upstream release page, which for a build without version arguments is `https://github.com/sysadminsmedia/homebox/releases/tag/v` and does not exist. Neither reaches Tofu's changes.
-  - From `pin/2026-10-23.1`, the image sets `HBOX_OPTIONS_SOURCE_URL` to this repository at the exact tag, https://github.com/tofu-gallery/homebox/tree/pin/2026-10-23.1, and both the sign-in page's GitHub icon and the signed-in footer's "GitHub Project" link open it. This repository is public, and the tag never moves.
+  - From `pin/2026-10-23.1`, the image sets `HBOX_OPTIONS_SOURCE_URL` to this repository at the pin's own tag, and both the sign-in page's GitHub icon and the signed-in footer's "GitHub Project" link open it. For the current pin, `pin/2026-10-23.2`, that is https://github.com/tofu-gallery/homebox/tree/pin/2026-10-23.2; a copy of `pin/2026-10-23.1` opens `.../tree/pin/2026-10-23.1`, which differs from the current pin only by `.gitlab-ci.yml`, the address in the `Dockerfile` and this file. This repository is public, and a tag never moves.
   - An owner who changes their copy's code runs a modified version of their own. They have to publish that source and set `HBOX_OPTIONS_SOURCE_URL` to it on the app's Keys & settings page. The server reads it at start, so it takes effect with the next deploy and needs no code change.
 
 ## Verification
