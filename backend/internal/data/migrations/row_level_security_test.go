@@ -19,6 +19,8 @@ import (
 const rowLevelSecurityFile = "tofu/row_level_security.sql"
 
 // The safety check's two patterns, as it writes them in JavaScript. They read every .sql file whole, comments included.
+// They match as the safety check's do for ASCII text; Go's (?i) also folds the long s and the Kelvin sign into s and
+// k, which no migration here uses.
 var (
 	createTablePattern = safetyCheckPattern(`create\s+table\s+(?:if\s+not\s+exists\s+)?((?:"[^"]+"|[\w]+)(?:\.(?:"[^"]+"|[\w]+))?)`)
 	enableRLSPattern   = safetyCheckPattern(`alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?((?:"[^"]+"|[\w]+)(?:\.(?:"[^"]+"|[\w]+))?)\s+enable\s+row\s+level\s+security`)

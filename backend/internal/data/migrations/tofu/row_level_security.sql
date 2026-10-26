@@ -2,8 +2,8 @@
 -- Nothing runs this file. The start-up step (app/api/tofu_schema.go) turns on row-level security for every table at
 -- every start, tables that later migrations add included. This file says the same in SQL for tools that read SQL
 -- files rather than run the app, such as Tofu's safety check, which otherwise warns that the tables have no access
--- rules. It names every table any .sql file in this repository makes, current or since renamed, SQLite's included;
--- IF EXISTS makes the lines for tables that no longer exist do nothing.
+-- rules. It names every table any .sql file in this repository makes, current or since renamed, merged or dropped,
+-- SQLite's included; IF EXISTS makes the lines for tables that no longer exist do nothing.
 -- internal/data/migrations/row_level_security_test.go keeps the list exact.
 ALTER TABLE IF EXISTS public."api_keys" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE IF EXISTS public."attachments" ENABLE ROW LEVEL SECURITY;
