@@ -98,6 +98,8 @@ Homebox stores each API key as an HMAC keyed with `HBOX_AUTH_API_KEY_PEPPER`. Si
 
 ## Verification
 
+`pin/2026-10-26.1` (2026-10-26) is `pin/2026-10-26` without `backend/cosign.key`, with the `Dockerfile`'s `HBOX_OPTIONS_SOURCE_URL` naming its own tag and with this file's text updated; the app's code is unchanged. Tofu's own check on the pushed `tofu` branch printed `safety ok (14 findings)` for 1017 files. Tofu's credential rule for uploads, run over every file of the commit's `git archive`, refused no file; on `pin/2026-10-26` it refused `backend/cosign.key`. Everything below ran on `pin/2026-10-26`, and "this pin" below means that tag.
+
 2026-10-26, on macOS arm64 against 127.0.0.1 only. No Docker, nothing deployed.
 
 Every build below was made the way the image builds it, from an import-style copy of the commit: `git archive`, then every file's execute bit removed. The frontend was built with pnpm 10.28.0 (`pnpm install --frozen-lockfile` in 11 s; `pnpm build` in 12 s, giving `.output/public`) and copied into `backend/app/api/static/public`. The server was then built with Go 1.27.3 (`go.mod` asks for 1.27.0): `CGO_ENABLED=0 go build -ldflags "-s -w -X main.commit= -X main.buildTime= -X main.version=" ./app/api/*.go`. Each server ran as the container runs it: `/bin/sh tofu-entrypoint.sh /data/config.yml` with the `Dockerfile`'s own `ENV` lines, its own `PORT` and storage folder, and `DATABASE_URL=postgresql://app@127.0.0.1:<port>/homebox_r9?sslmode=require`. Only a test copy of the script was changed, so that its `exec /app/api` points at the local build.
