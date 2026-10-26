@@ -3,7 +3,7 @@
 This repository is Tofu's copy of **sysadminsmedia/homebox** (licence: AGPL-3.0), listed in Tofu's app gallery as **Homebox**: a home inventory app for recording what you own, where it is kept, its receipts, warranties and maintenance.
 
 - `main` mirrors the upstream repository and is never committed to by Tofu.
-- `tofu` carries Tofu's own changes; tags named `pin/<date>` mark the versions the gallery points to. The current pin is `pin/2026-10-26`.
+- `tofu` carries Tofu's own changes; tags named `pin/<date>` mark the versions the gallery points to. The current pin is `pin/2026-10-26.1`.
 - A visitor who chooses this app gets a private snapshot of the pinned version in their own Tofu account. Their copy does not follow upstream updates.
 - Upstream: https://github.com/sysadminsmedia/homebox at `387cd6cab0faae6d97e4819e220f88aee06e463b` (2026-10-23, v0.27.0 plus two commits). The pins up to `pin/2026-10-23.2` were made from `1fd28822634a3d5935c002d569559ef46530d4a0` (2026-10-17, v0.27.0 plus one commit); the one upstream commit since then widens the scrollbars in Chromium browsers.
 
@@ -23,7 +23,7 @@ This repository is Tofu's copy of **sysadminsmedia/homebox** (licence: AGPL-3.0)
 - `Dockerfile`:
   - `ENTRYPOINT` is now `/bin/sh /app/tofu-entrypoint.sh`, and the script is copied into the image. The `CMD` is unchanged.
   - `HBOX_THUMBNAIL_ENABLED=false` and `HBOX_OPTIONS_GITHUB_RELEASE_CHECK=false` are now image defaults, and the owner can set either back to `true`. Thumbnails cost image processing for photos that are lost on restart anyway (see below). The release check calls GitHub every hour to show an update notice, but this copy is a fixed snapshot.
-  - `HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26` is an image default: the address of this copy's exact source (see "Licence and source code").
+  - `HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26.1` is an image default: the address of this copy's exact source (see "Licence and source code").
   - `HEALTHCHECK` checks the port the server actually listens on (`PORT`, then `HBOX_WEB_PORT`, then 7745), not a fixed 7745.
 - `backend/app/api/setup.go`: when `DATABASE_URL` is set, the Postgres connection adds `default_query_exec_mode=cache_describe`. Tofu's `DATABASE_URL` goes through a transaction pooler, which keeps no named prepared statements, and those are pgx's default. With this mode, every query runs on the unnamed statement.
 - The schema step on PostgreSQL (from `pin/2026-10-26`; see "Start-up when several starts run at once"):
@@ -93,7 +93,7 @@ Homebox stores each API key as an HMAC keyed with `HBOX_AUTH_API_KEY_PEPPER`. Si
 - The Homebox name and logo belong to the upstream project; the gallery uses them only to say which app this is. `backend/internal/core/currencies/currencies.json` is upstream's bundled currency list. No fonts are bundled.
 - **Source offer (AGPL-3.0 section 13).** A modified copy that people use over a network has to offer them its own source code.
   - What a copy of the earlier pin, `pin/2026-10-23`, shows: the sign-in page's GitHub icon opens upstream's repository, https://github.com/sysadminsmedia/homebox, and the signed-in footer links "Version: … Build: …" to an upstream release page, which for a build without version arguments is `https://github.com/sysadminsmedia/homebox/releases/tag/v` and does not exist. Neither reaches Tofu's changes.
-  - From `pin/2026-10-23.1`, the image sets `HBOX_OPTIONS_SOURCE_URL` to this repository at the pin's own tag, and both the sign-in page's GitHub icon and the signed-in footer's "GitHub Project" link open it. For the current pin, `pin/2026-10-26`, that is https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26. A copy of an earlier pin opens its own tag's address (`.../tree/pin/2026-10-23.2` or `.../tree/pin/2026-10-23.1`). This repository is public, and a tag never moves.
+  - From `pin/2026-10-23.1`, the image sets `HBOX_OPTIONS_SOURCE_URL` to this repository at the pin's own tag, and both the sign-in page's GitHub icon and the signed-in footer's "GitHub Project" link open it. For the current pin, `pin/2026-10-26.1`, that is https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26.1. A copy of an earlier pin opens its own tag's address (`.../tree/pin/2026-10-26`, `.../tree/pin/2026-10-23.2` or `.../tree/pin/2026-10-23.1`). This repository is public, and a tag never moves.
   - An owner who changes their copy's code runs a modified version of their own. They have to publish that source and set `HBOX_OPTIONS_SOURCE_URL` to it on the app's Keys & settings page. The server reads it at start, so it takes effect with the next deploy and needs no code change.
 
 ## Verification

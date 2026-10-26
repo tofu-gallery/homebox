@@ -76,7 +76,7 @@ ENV HBOX_THUMBNAIL_ENABLED=false
 ENV HBOX_OPTIONS_GITHUB_RELEASE_CHECK=false
 # Tofu (2026-10-23): the sign-in page and footer link to the exact source this image is built from (AGPL-3.0 section 13)
 # Tofu (2026-10-26): the address names this pin's own tag
-ENV HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26
+ENV HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26.1
 
 # Install necessary runtime dependencies
 RUN apk --no-cache add ca-certificates wget mosquitto-clients && \
