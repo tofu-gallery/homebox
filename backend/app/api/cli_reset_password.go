@@ -113,7 +113,14 @@ func generateResetLinkOffline(cfg *config.Config, email string) (string, error) 
 	if err := goose.SetDialect(driver); err != nil {
 		return "", fmt.Errorf("set dialect: %w", err)
 	}
-	if err := goose.Up(c.Sql(), driver); err != nil {
+	// Tofu (2026-10-26): on PostgreSQL the migrations go through the same locked schema step as a server start
+	// (tofu_schema.go), so this command never runs them beside a start; SQLite runs goose.Up as upstream does.
+	if driver == config.DriverPostgres {
+		err = tofuMigratePostgres(context.Background(), c.Sql(), migrationsFs, driver)
+	} else {
+		err = goose.Up(c.Sql(), driver)
+	}
+	if err != nil {
 		return "", fmt.Errorf("apply migrations: %w", err)
 	}
 

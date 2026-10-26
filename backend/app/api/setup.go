@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,6 +83,9 @@ func resolveDriver(driver string) (sqlDriverName, entDialect string, err error) 
 }
 
 // runMigrations applies all pending goose migrations for the given driver.
+// Tofu (2026-10-26): on PostgreSQL the migrations run inside Tofu's locked schema step (tofu_schema.go), which also
+// turns on row-level security, so that several starts at once take turns; the reset-password command goes through
+// it too. SQLite runs goose.Up exactly as upstream does.
 func runMigrations(c *ent.Client, driver string) error {
 	migrationsFs, err := migrations.Migrations(driver)
 	if err != nil {
@@ -91,6 +95,13 @@ func runMigrations(c *ent.Client, driver string) error {
 	if err := goose.SetDialect(driver); err != nil {
 		log.Error().Str("driver", driver).Msg("unsupported database driver")
 		return fmt.Errorf("unsupported database driver: %s", driver)
+	}
+	if driver == config.DriverPostgres {
+		if err := tofuMigratePostgres(context.Background(), c.Sql(), migrationsFs, driver); err != nil {
+			log.Error().Err(err).Msg("failed to migrate database")
+			return err
+		}
+		return nil
 	}
 	if err := goose.Up(c.Sql(), driver); err != nil {
 		log.Error().Err(err).Msg("failed to migrate database")
