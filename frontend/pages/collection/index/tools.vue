@@ -356,7 +356,7 @@
   onServerEvent(ServerEvent.ImportMutation, refreshBackups);
 
   function downloadUrl(id: string): string {
-    return api.backups.downloadURL(id);
+    return api.backups.downloadURL(id, prefs.value.collectionId ?? undefined);
   }
 
   function formatBytes(n: number): string {
@@ -371,7 +371,7 @@
     return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
   }
 
-  function formatCreated(iso: string): string {
+  function formatCreated(iso: string | Date): string {
     return new Date(iso).toLocaleString();
   }
 
