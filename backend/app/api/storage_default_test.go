@@ -33,7 +33,8 @@ func TestApplyDefaultStorage(t *testing.T) {
 			want:   "s3://my-bucket?region=eu-west-1",
 		},
 		{
-			name:   "an owner's config-file value wins",
+			// config.New has copied --storage-conn-string into the config.
+			name:   "an owner's command-line value wins",
 			driver: config.DriverPostgres,
 			config: "file:///var/lib/homebox",
 			want:   "file:///var/lib/homebox",

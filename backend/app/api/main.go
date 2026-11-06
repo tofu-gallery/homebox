@@ -87,8 +87,9 @@ func validatePostgresSSLMode(sslMode string) bool {
 // database survives both.
 //
 // Only Homebox's own built-in default is replaced: a value in
-// HBOX_STORAGE_CONN_STRING, or a non-default value in the config file, still
-// wins, so an owner who pointed storage at a bucket keeps that bucket.
+// HBOX_STORAGE_CONN_STRING, or a non-default value of the command-line flag
+// --storage-conn-string, still wins, so an owner who pointed storage at a
+// bucket keeps that bucket. Homebox reads no configuration file.
 func applyDefaultStorage(cfg *config.Config) {
 	// The driver is compared in lower case, as setupDatabase reads it.
 	if strings.ToLower(cfg.Database.Driver) != config.DriverPostgres || os.Getenv("HBOX_STORAGE_CONN_STRING") != "" {
