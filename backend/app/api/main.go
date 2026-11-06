@@ -90,7 +90,8 @@ func validatePostgresSSLMode(sslMode string) bool {
 // HBOX_STORAGE_CONN_STRING, or a non-default value in the config file, still
 // wins, so an owner who pointed storage at a bucket keeps that bucket.
 func applyDefaultStorage(cfg *config.Config) {
-	if cfg.Database.Driver != config.DriverPostgres || os.Getenv("HBOX_STORAGE_CONN_STRING") != "" {
+	// The driver is compared in lower case, as setupDatabase reads it.
+	if strings.ToLower(cfg.Database.Driver) != config.DriverPostgres || os.Getenv("HBOX_STORAGE_CONN_STRING") != "" {
 		return
 	}
 	if cfg.Storage.ConnString != "file:///./" {
@@ -106,7 +107,7 @@ func registerBlobStorage(ctx context.Context, cfg *config.Config, c *ent.Client)
 	if !strings.HasPrefix(cfg.Storage.ConnString, postgresblob.Scheme+"://") {
 		return nil
 	}
-	if cfg.Database.Driver != config.DriverPostgres {
+	if strings.ToLower(cfg.Database.Driver) != config.DriverPostgres {
 		return fmt.Errorf("storage %s requires the postgres database driver, not %s",
 			cfg.Storage.ConnString, cfg.Database.Driver)
 	}

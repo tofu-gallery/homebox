@@ -9,8 +9,11 @@
 // database survives both. This driver puts the bytes in that database, in two
 // tables of its own, and leaves every existing table alone:
 //
-//   - tofu_blob_objects has one row per key: the content the key holds, its
-//     content type, size and chunk size, and when it was created and changed.
+//   - tofu_blob_objects has one row per key: the content the key holds, the
+//     attributes the SDK keeps with an object (content type, Cache-Control,
+//     Content-Disposition, Content-Encoding, Content-Language, metadata and
+//     the MD5 of the bytes), its size and chunk size, and when it was created
+//     and changed.
 //   - tofu_blob_chunks holds each content's bytes in bytea chunks of ChunkSize
 //     bytes, the last one shorter. No object is limited by a bytea value's
 //     1 GiB, and neither a writer nor a long read holds more than a chunk or
@@ -34,13 +37,21 @@
 // object whole. A delete or overwrite that commits after the first Read
 // changes nothing the reader returns; one that commits between opening the
 // reader and its first Read makes that Read fail with FailedPrecondition.
+//
+// A key may be any UTF-8 string except one that contains U+0000, which a
+// PostgreSQL text value cannot hold; every operation refuses such a key with
+// InvalidArgument. SignedURL returns Unimplemented: PostgreSQL has no address
+// a client could fetch an object from.
 package postgresblob
 
 import (
 	"context"
+	"crypto/md5"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"net/url"
@@ -95,10 +106,19 @@ const (
 )
 
 const (
+	// metadata holds the object's metadata as a JSON object, or '' when it has
+	// none. It is text rather than jsonb because jsonb cannot hold U+0000,
+	// which a metadata key or value may contain.
 	createObjectsSQL = `CREATE TABLE IF NOT EXISTS ` + ObjectsTable + ` (
 	"key" text PRIMARY KEY,
 	content_id uuid NOT NULL,
 	content_type text NOT NULL,
+	cache_control text NOT NULL DEFAULT '',
+	content_disposition text NOT NULL DEFAULT '',
+	content_encoding text NOT NULL DEFAULT '',
+	content_language text NOT NULL DEFAULT '',
+	metadata text NOT NULL DEFAULT '',
+	md5 bytea NOT NULL,
 	size bigint NOT NULL CHECK (size >= 0),
 	chunk_size integer NOT NULL CHECK (chunk_size > 0),
 	created_at timestamptz NOT NULL DEFAULT now(),
@@ -122,7 +142,8 @@ const (
 WHERE c.oid IN (to_regclass($1), to_regclass($2)) AND NOT c.relrowsecurity
 	AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)`
 
-	objectSQL = `SELECT content_id::text, content_type, size, chunk_size, created_at, mod_time
+	objectSQL = `SELECT content_id::text, content_type, cache_control, content_disposition, content_encoding,
+	content_language, metadata, md5, size, chunk_size, created_at, mod_time
 FROM ` + ObjectsTable + ` WHERE "key" = $1`
 
 	// chunkRangeSQL joins chunks $3 to $4 of one content in one statement.
@@ -135,18 +156,31 @@ WHERE "key" = $1 AND content_id = $2::uuid AND seq BETWEEN $3::int AND $4::int`
 
 	insertChunkSQL = `INSERT INTO ` + ChunksTable + ` ("key", content_id, seq, data) VALUES ($1, $2::uuid, $3::int, $4)`
 
-	upsertObjectSQL = `INSERT INTO ` + ObjectsTable + ` ("key", content_id, content_type, size, chunk_size, created_at, mod_time)
-VALUES ($1, $2::uuid, $3, $4, $5, statement_timestamp(), statement_timestamp())
-ON CONFLICT ("key") DO UPDATE SET
+	// A write replaces the object: every attribute, its creation time
+	// included, is the new object's.
+	replaceObject = ` ON CONFLICT ("key") DO UPDATE SET
 	content_id = EXCLUDED.content_id,
 	content_type = EXCLUDED.content_type,
+	cache_control = EXCLUDED.cache_control,
+	content_disposition = EXCLUDED.content_disposition,
+	content_encoding = EXCLUDED.content_encoding,
+	content_language = EXCLUDED.content_language,
+	metadata = EXCLUDED.metadata,
+	md5 = EXCLUDED.md5,
 	size = EXCLUDED.size,
 	chunk_size = EXCLUDED.chunk_size,
+	created_at = EXCLUDED.created_at,
 	mod_time = EXCLUDED.mod_time`
 
-	insertObjectSQL = `INSERT INTO ` + ObjectsTable + ` ("key", content_id, content_type, size, chunk_size, created_at, mod_time)
-VALUES ($1, $2::uuid, $3, $4, $5, statement_timestamp(), statement_timestamp())
-ON CONFLICT ("key") DO NOTHING`
+	objectColumns = `("key", content_id, content_type, cache_control, content_disposition, content_encoding,
+	content_language, metadata, md5, size, chunk_size, created_at, mod_time)`
+
+	insertObjectValues = `INSERT INTO ` + ObjectsTable + ` ` + objectColumns + `
+VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, statement_timestamp(), statement_timestamp())`
+
+	upsertObjectSQL = insertObjectValues + replaceObject
+
+	insertObjectSQL = insertObjectValues + ` ON CONFLICT ("key") DO NOTHING`
 
 	// deleteOtherChunksSQL runs after the key's row points at the new
 	// content, and as a statement of its own: a write to the same key that
@@ -160,30 +194,28 @@ ON CONFLICT ("key") DO NOTHING`
 	// copySQL reads the source row and copies its chunks in one statement, so
 	// both come from one snapshot, and points the destination at the copy.
 	copySQL = `WITH src AS (
-	SELECT content_id, content_type, size, chunk_size FROM ` + ObjectsTable + ` WHERE "key" = $2
+	SELECT content_id, content_type, cache_control, content_disposition, content_encoding, content_language,
+		metadata, md5, size, chunk_size
+	FROM ` + ObjectsTable + ` WHERE "key" = $2
 ), copied AS (
 	INSERT INTO ` + ChunksTable + ` ("key", content_id, seq, data)
 	SELECT $1, $3::uuid, c.seq, c.data FROM ` + ChunksTable + ` c
 	JOIN src ON c."key" = $2 AND c.content_id = src.content_id
 )
-INSERT INTO ` + ObjectsTable + ` ("key", content_id, content_type, size, chunk_size, created_at, mod_time)
-SELECT $1, $3::uuid, content_type, size, chunk_size, statement_timestamp(), statement_timestamp() FROM src
-ON CONFLICT ("key") DO UPDATE SET
-	content_id = EXCLUDED.content_id,
-	content_type = EXCLUDED.content_type,
-	size = EXCLUDED.size,
-	chunk_size = EXCLUDED.chunk_size,
-	mod_time = EXCLUDED.mod_time`
+INSERT INTO ` + ObjectsTable + ` ` + objectColumns + `
+SELECT $1, $3::uuid, content_type, cache_control, content_disposition, content_encoding, content_language,
+	metadata, md5, size, chunk_size, statement_timestamp(), statement_timestamp()
+FROM src` + replaceObject
 
 	// COLLATE "C" makes ORDER BY and range comparisons use UTF-8 byte order,
 	// which is what the blob driver contract requires; a database's default
 	// collation may order differently.
-	listFlatSQL = `SELECT "key", size, mod_time FROM ` + ObjectsTable + `
+	listFlatSQL = `SELECT "key", size, mod_time, md5 FROM ` + ObjectsTable + `
 WHERE starts_with("key", $1) AND ($2::text = '' OR "key" COLLATE "C" > $2 COLLATE "C")
 ORDER BY "key" COLLATE "C"
 LIMIT $3`
 
-	listAllSQL = `SELECT "key", size, mod_time FROM ` + ObjectsTable + `
+	listAllSQL = `SELECT "key", size, mod_time, md5 FROM ` + ObjectsTable + `
 WHERE starts_with("key", $1)
 ORDER BY "key" COLLATE "C"`
 )
@@ -195,13 +227,6 @@ var (
 
 	// errWriterClosed is returned when Write or Close is called after Close.
 	errWriterClosed = errors.New("postgresblob: writer is already closed")
-
-	// errUnsupportedOptions is returned for a write that asks for something
-	// the driver does not store, rather than silently dropping it. Homebox
-	// sets only a content type and an MD5, which the SDK itself checks.
-	errUnsupportedOptions = fmt.Errorf(
-		"postgresblob: metadata, Cache-Control, Content-Disposition, Content-Encoding and Content-Language are not stored: %w",
-		gcerrors.ErrUnimplemented)
 
 	schemeOnce sync.Once
 
@@ -307,23 +332,10 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	// security on where it is off and the app's role owns the table: ALTER
 	// TABLE takes an ACCESS EXCLUSIVE lock, and on every later start that lock
 	// would make the instances still serving wait to read or write attachments.
-	rows, err := tx.QueryContext(ctx, rowSecurityOffSQL, ObjectsTable, ChunksTable)
+	open, err := tablesWithoutRowSecurity(ctx, tx)
 	if err != nil {
-		return fmt.Errorf("postgresblob: read row-level security: %w", err)
+		return err
 	}
-	var open []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("postgresblob: read row-level security: %w", err)
-		}
-		open = append(open, name)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("postgresblob: read row-level security: %w", err)
-	}
-	_ = rows.Close()
 	for _, name := range open {
 		var table string
 		switch name {
@@ -342,6 +354,29 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("postgresblob: commit schema: %w", err)
 	}
 	return nil
+}
+
+// tablesWithoutRowSecurity names the driver's tables that rowSecurityOffSQL
+// finds. Its rows are closed when it returns, before the transaction runs its
+// next statement.
+func tablesWithoutRowSecurity(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, rowSecurityOffSQL, ObjectsTable, ChunksTable)
+	if err != nil {
+		return nil, fmt.Errorf("postgresblob: read row-level security: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var open []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("postgresblob: read row-level security: %w", err)
+		}
+		open = append(open, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgresblob: read row-level security: %w", err)
+	}
+	return open, nil
 }
 
 type bucket struct {
@@ -398,8 +433,12 @@ func (*bucket) ErrorAs(error, any) bool { return false }
 // application and is left open.
 func (*bucket) Close() error { return nil }
 
-// Attributes implements driver.Bucket.
+// Attributes implements driver.Bucket. The ETag names the content the key
+// holds, so it changes with every write and stays the same until the next.
 func (b *bucket) Attributes(ctx context.Context, key string) (*driver.Attributes, error) {
+	if err := checkKey(key); err != nil {
+		return nil, err
+	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
@@ -408,26 +447,43 @@ func (b *bucket) Attributes(ctx context.Context, key string) (*driver.Attributes
 		return nil, err
 	}
 	return &driver.Attributes{
-		ContentType: normalizeContentType(obj.contentType),
-		Size:        obj.size,
-		CreateTime:  obj.created,
-		ModTime:     obj.modified,
+		CacheControl:       obj.cacheControl,
+		ContentDisposition: obj.contentDisposition,
+		ContentEncoding:    obj.contentEncoding,
+		ContentLanguage:    obj.contentLanguage,
+		ContentType:        normalizeContentType(obj.contentType),
+		Metadata:           obj.metadata,
+		CreateTime:         obj.created,
+		ModTime:            obj.modified,
+		Size:               obj.size,
+		MD5:                obj.md5,
+		ETag:               `"` + obj.contentID + `"`,
 	}, nil
 }
 
 type object struct {
-	contentID   string
-	contentType string
-	size        int64
-	chunkSize   int64
-	created     time.Time
-	modified    time.Time
+	contentID          string
+	contentType        string
+	cacheControl       string
+	contentDisposition string
+	contentEncoding    string
+	contentLanguage    string
+	metadata           map[string]string
+	md5                []byte
+	size               int64
+	chunkSize          int64
+	created            time.Time
+	modified           time.Time
 }
 
 func (b *bucket) object(ctx context.Context, key string) (object, error) {
-	var obj object
-	err := b.db.QueryRowContext(ctx, objectSQL, key).
-		Scan(&obj.contentID, &obj.contentType, &obj.size, &obj.chunkSize, &obj.created, &obj.modified)
+	var (
+		obj      object
+		metadata string
+	)
+	err := b.db.QueryRowContext(ctx, objectSQL, key).Scan(&obj.contentID, &obj.contentType, &obj.cacheControl,
+		&obj.contentDisposition, &obj.contentEncoding, &obj.contentLanguage, &metadata, &obj.md5,
+		&obj.size, &obj.chunkSize, &obj.created, &obj.modified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return object{}, notFound(key)
 	}
@@ -436,6 +492,11 @@ func (b *bucket) object(ctx context.Context, key string) (object, error) {
 	}
 	if obj.chunkSize <= 0 {
 		return object{}, fmt.Errorf("postgresblob: %q has chunk size %d: %w", key, obj.chunkSize, gcerrors.ErrInternal)
+	}
+	if metadata != "" {
+		if err := json.Unmarshal([]byte(metadata), &obj.metadata); err != nil {
+			return object{}, fmt.Errorf("postgresblob: %q has unreadable metadata: %w: %w", key, err, gcerrors.ErrInternal)
+		}
 	}
 	return obj, nil
 }
@@ -446,6 +507,9 @@ func (b *bucket) object(ctx context.Context, key string) (object, error) {
 func (b *bucket) NewRangeReader(ctx context.Context, key string, offset, length int64, opts *driver.ReaderOptions) (driver.Reader, error) {
 	if offset < 0 {
 		return nil, fmt.Errorf("%w: negative offset %d", gcerrors.ErrInvalidArgument, offset)
+	}
+	if err := checkKey(key); err != nil {
+		return nil, err
 	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
@@ -495,25 +559,38 @@ type reader struct {
 	attrs   driver.ReaderAttributes
 }
 
-// Read implements io.Reader.
+// Read implements io.Reader. It fills p across chunk boundaries, as the SDK's
+// conformance suite expects of a driver, and ends a streamed read's snapshot
+// as soon as the range's last byte is returned.
 func (r *reader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
-	for len(r.buf) == 0 {
-		if r.pos >= r.end {
-			r.finish()
-			return 0, io.EOF
+	n := 0
+	for n < len(p) {
+		if len(r.buf) == 0 {
+			if r.pos >= r.end {
+				r.finish()
+				if n > 0 {
+					return n, nil
+				}
+				return 0, io.EOF
+			}
+			if err := r.fill(); err != nil {
+				r.err = err
+				r.finish()
+				return n, err
+			}
+			continue
 		}
-		if err := r.fill(); err != nil {
-			r.err = err
-			r.finish()
-			return 0, err
-		}
+		copied := copy(p[n:], r.buf)
+		r.buf = r.buf[copied:]
+		r.pos += int64(copied)
+		n += copied
 	}
-	n := copy(p, r.buf)
-	r.buf = r.buf[n:]
-	r.pos += int64(n)
+	if r.pos >= r.end {
+		r.finish()
+	}
 	return n, nil
 }
 
@@ -601,11 +678,30 @@ func (r *reader) Attributes() *driver.ReaderAttributes { return &r.attrs }
 // As implements driver.Reader.
 func (*reader) As(any) bool { return false }
 
-// NewTypedWriter implements driver.Bucket.
+// NewTypedWriter implements driver.Bucket. Every attribute in opts is kept
+// with the object; ContentMD5 is checked by the SDK, and the driver stores the
+// MD5 of the bytes it was given, which Attributes returns.
 func (b *bucket) NewTypedWriter(ctx context.Context, key, contentType string, opts *driver.WriterOptions) (driver.Writer, error) {
-	if len(opts.Metadata) > 0 || opts.CacheControl != "" || opts.ContentDisposition != "" ||
-		opts.ContentEncoding != "" || opts.ContentLanguage != "" {
-		return nil, errUnsupportedOptions
+	if err := checkNewKey(key); err != nil {
+		return nil, err
+	}
+	for name, value := range map[string]string{
+		"content type": contentType, "Cache-Control": opts.CacheControl,
+		"Content-Disposition": opts.ContentDisposition, "Content-Encoding": opts.ContentEncoding,
+		"Content-Language": opts.ContentLanguage,
+	} {
+		if strings.IndexByte(value, 0) >= 0 {
+			return nil, fmt.Errorf("%w: postgresblob: the %s of %q contains U+0000, which PostgreSQL text cannot hold",
+				gcerrors.ErrInvalidArgument, name, key)
+		}
+	}
+	metadata := ""
+	if len(opts.Metadata) > 0 {
+		encoded, err := json.Marshal(opts.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("%w: postgresblob: metadata of %q: %w", gcerrors.ErrInvalidArgument, key, err)
+		}
+		metadata = string(encoded)
 	}
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
@@ -614,27 +710,39 @@ func (b *bucket) NewTypedWriter(ctx context.Context, key, contentType string, op
 		return nil, err
 	}
 	return &writer{
-		db:          b.db,
-		ctx:         ctx,
-		key:         key,
-		contentType: normalizeContentType(contentType),
-		ifNotExist:  opts.IfNotExist,
-		contentID:   uuid.NewString(),
-		chunkSize:   b.chunkSize,
+		db:                 b.db,
+		ctx:                ctx,
+		key:                key,
+		contentType:        normalizeContentType(contentType),
+		cacheControl:       opts.CacheControl,
+		contentDisposition: opts.ContentDisposition,
+		contentEncoding:    opts.ContentEncoding,
+		contentLanguage:    opts.ContentLanguage,
+		metadata:           metadata,
+		ifNotExist:         opts.IfNotExist,
+		contentID:          uuid.NewString(),
+		chunkSize:          b.chunkSize,
+		md5:                md5.New(),
 	}, nil
 }
 
 type writer struct {
-	db          *sql.DB
-	ctx         context.Context
-	key         string
-	contentType string
-	ifNotExist  bool
-	contentID   string
-	chunkSize   int
+	db                 *sql.DB
+	ctx                context.Context
+	key                string
+	contentType        string
+	cacheControl       string
+	contentDisposition string
+	contentEncoding    string
+	contentLanguage    string
+	metadata           string // JSON, or "" for none
+	ifNotExist         bool
+	contentID          string
+	chunkSize          int
 
 	tx     *sql.Tx // begun with the first chunk; holds every chunk until Close commits
 	buf    []byte  // the next chunk, not yet full
+	md5    hash.Hash
 	seq    int32
 	size   int64
 	err    error
@@ -650,6 +758,9 @@ func (w *writer) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
+	// A write that fails part way fails the whole object, so hashing all of p
+	// up front never records bytes that a committed object lacks.
+	_, _ = w.md5.Write(p)
 	written := 0
 	for len(p) > 0 {
 		if len(w.buf) == 0 && len(p) >= w.chunkSize {
@@ -760,8 +871,10 @@ func (w *writer) Close() error {
 }
 
 func (w *writer) publish() error {
+	args := []any{w.key, w.contentID, w.contentType, w.cacheControl, w.contentDisposition, w.contentEncoding,
+		w.contentLanguage, w.metadata, w.md5.Sum(nil), w.size, w.chunkSize}
 	if w.ifNotExist {
-		res, err := w.tx.ExecContext(w.ctx, insertObjectSQL, w.key, w.contentID, w.contentType, w.size, w.chunkSize)
+		res, err := w.tx.ExecContext(w.ctx, insertObjectSQL, args...)
 		if err != nil {
 			return fmt.Errorf("postgresblob: write %q: %w", w.key, err)
 		}
@@ -774,7 +887,7 @@ func (w *writer) publish() error {
 		}
 		return nil
 	}
-	if _, err := w.tx.ExecContext(w.ctx, upsertObjectSQL, w.key, w.contentID, w.contentType, w.size, w.chunkSize); err != nil {
+	if _, err := w.tx.ExecContext(w.ctx, upsertObjectSQL, args...); err != nil {
 		return fmt.Errorf("postgresblob: write %q: %w", w.key, err)
 	}
 	if _, err := w.tx.ExecContext(w.ctx, deleteOtherChunksSQL, w.key, w.contentID); err != nil {
@@ -787,6 +900,9 @@ func (w *writer) publish() error {
 // holds the row, the delete waits for it, and the chunk delete that follows
 // sees that write's chunks.
 func (b *bucket) Delete(ctx context.Context, key string, opts *driver.DeleteOptions) error {
+	if err := checkKey(key); err != nil {
+		return err
+	}
 	if err := b.ensure(ctx); err != nil {
 		return err
 	}
@@ -820,8 +936,15 @@ func (b *bucket) Delete(ctx context.Context, key string, opts *driver.DeleteOpti
 }
 
 // Copy implements driver.Bucket. It copies inside the database, without
-// moving the bytes through the client.
+// moving the bytes through the client, and the copy keeps every attribute of
+// the source.
 func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.CopyOptions) error {
+	if err := checkNewKey(dstKey); err != nil {
+		return err
+	}
+	if err := checkKey(srcKey); err != nil {
+		return err
+	}
 	if err := b.ensure(ctx); err != nil {
 		return err
 	}
@@ -857,14 +980,19 @@ func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.C
 
 // ListPaged implements driver.Bucket. Without a delimiter it pages by key in
 // byte order; with one it collapses keys below a directory into one entry and
-// pages the resulting entries. Homebox itself does not list the bucket; this
-// exists because the driver interface requires it.
+// pages the resulting entries. Homebox lists only through the SDK's io/fs
+// Open, which its thumbnail step uses: for a key that does not exist, Open
+// lists to see whether the name is a directory.
 func (b *bucket) ListPaged(ctx context.Context, opts *driver.ListOptions) (*driver.ListPage, error) {
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
 	if err := callBefore(opts.BeforeList); err != nil {
 		return nil, err
+	}
+	if strings.IndexByte(opts.Prefix, 0) >= 0 {
+		// No key holds U+0000 (checkKey), so no key has this prefix.
+		return &driver.ListPage{}, nil
 	}
 	if opts.Delimiter != "" {
 		return b.listDelimited(ctx, opts)
@@ -885,15 +1013,11 @@ func (b *bucket) listFlat(ctx context.Context, opts *driver.ListOptions) (*drive
 
 	objects := make([]*driver.ListObject, 0, pageSize)
 	for rows.Next() {
-		var (
-			key      string
-			size     int64
-			modified time.Time
-		)
-		if err := rows.Scan(&key, &size, &modified); err != nil {
-			return nil, fmt.Errorf("postgresblob: list: scan: %w", err)
+		object, err := scanListObject(rows)
+		if err != nil {
+			return nil, err
 		}
-		objects = append(objects, &driver.ListObject{Key: key, Size: size, ModTime: modified})
+		objects = append(objects, object)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgresblob: list: %w", err)
@@ -917,15 +1041,11 @@ func (b *bucket) listDelimited(ctx context.Context, opts *driver.ListOptions) (*
 	entries := make([]*driver.ListObject, 0)
 	lastDir := ""
 	for rows.Next() {
-		var (
-			key      string
-			size     int64
-			modified time.Time
-		)
-		if err := rows.Scan(&key, &size, &modified); err != nil {
-			return nil, fmt.Errorf("postgresblob: list: scan: %w", err)
+		object, err := scanListObject(rows)
+		if err != nil {
+			return nil, err
 		}
-		rest := strings.TrimPrefix(key, opts.Prefix)
+		rest := strings.TrimPrefix(object.Key, opts.Prefix)
 		if i := strings.Index(rest, opts.Delimiter); i >= 0 {
 			dir := opts.Prefix + rest[:i+len(opts.Delimiter)]
 			if dir != lastDir {
@@ -934,7 +1054,7 @@ func (b *bucket) listDelimited(ctx context.Context, opts *driver.ListOptions) (*
 			}
 			continue
 		}
-		entries = append(entries, &driver.ListObject{Key: key, Size: size, ModTime: modified})
+		entries = append(entries, object)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgresblob: list: %w", err)
@@ -962,6 +1082,15 @@ func (b *bucket) listDelimited(ctx context.Context, opts *driver.ListOptions) (*
 	return &driver.ListPage{Objects: entries[offset:end], NextPageToken: next}, nil
 }
 
+// scanListObject reads one row of listFlatSQL or listAllSQL.
+func scanListObject(rows *sql.Rows) (*driver.ListObject, error) {
+	var object driver.ListObject
+	if err := rows.Scan(&object.Key, &object.Size, &object.ModTime, &object.MD5); err != nil {
+		return nil, fmt.Errorf("postgresblob: list: scan: %w", err)
+	}
+	return &object, nil
+}
+
 // SignedURL implements driver.Bucket. PostgreSQL has no URL a client can use
 // directly, so this reports the documented Unimplemented code rather than
 // pretending.
@@ -985,6 +1114,26 @@ func normalizeContentType(contentType string) string {
 
 func notFound(key string) error {
 	return fmt.Errorf("postgresblob: object %q: %w", key, gcerrors.ErrNotFound)
+}
+
+// checkKey refuses a key that contains U+0000. The SDK has already refused a
+// key that is not UTF-8; U+0000 is the one character left that a PostgreSQL
+// text value cannot hold. Homebox's keys are a group id and a hex hash.
+func checkKey(key string) error {
+	if strings.IndexByte(key, 0) >= 0 {
+		return fmt.Errorf("%w: postgresblob: key %q contains U+0000, which PostgreSQL text cannot hold",
+			gcerrors.ErrInvalidArgument, key)
+	}
+	return nil
+}
+
+// checkNewKey is checkKey for a key an object is written to, which must also
+// not be empty, as the SDK's conformance suite expects of every driver.
+func checkNewKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: postgresblob: an object needs a non-empty key", gcerrors.ErrInvalidArgument)
+	}
+	return checkKey(key)
 }
 
 // Compile-time checks that the driver types satisfy the gocloud interfaces.

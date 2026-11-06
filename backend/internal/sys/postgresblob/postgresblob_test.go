@@ -7,6 +7,7 @@ package postgresblob
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
@@ -837,27 +838,110 @@ func TestCopy(t *testing.T) {
 	assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
 }
 
-func TestUnsupportedWriterOptions(t *testing.T) {
+func TestAttributesKept(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	ctx := context.Background()
+
+	buckets(t, db, func(t *testing.T, b *blob.Bucket, _ bool) {
+		content := pattern(50)
+		sum := md5.Sum(content)
+		metadata := map[string]string{"owner": "someone", "nul\x00key": "a\x00value"}
+		opts := &blob.WriterOptions{
+			ContentType:        "image/png",
+			CacheControl:       "private, max-age=60",
+			ContentDisposition: `attachment; filename="photo.png"`,
+			ContentEncoding:    "identity",
+			ContentLanguage:    "en",
+			Metadata:           metadata,
+			ContentMD5:         sum[:],
+		}
+		require.NoError(t, b.WriteAll(ctx, "kept", content, opts))
+
+		attrs, err := b.Attributes(ctx, "kept")
+		require.NoError(t, err)
+		assert.Equal(t, "image/png", attrs.ContentType)
+		assert.Equal(t, "private, max-age=60", attrs.CacheControl)
+		assert.Equal(t, `attachment; filename="photo.png"`, attrs.ContentDisposition)
+		assert.Equal(t, "identity", attrs.ContentEncoding)
+		assert.Equal(t, "en", attrs.ContentLanguage)
+		assert.Equal(t, metadata, attrs.Metadata)
+		assert.Equal(t, sum[:], attrs.MD5)
+		assert.Regexp(t, `^"[0-9a-f-]{36}"$`, attrs.ETag)
+		assert.False(t, attrs.CreateTime.After(attrs.ModTime))
+
+		// An overwrite is a new object: its own ETag, and only what its own
+		// write set.
+		plain := []byte("plain")
+		require.NoError(t, b.WriteAll(ctx, "kept", plain, nil))
+		again, err := b.Attributes(ctx, "kept")
+		require.NoError(t, err)
+		assert.NotEqual(t, attrs.ETag, again.ETag)
+		assert.Empty(t, again.CacheControl)
+		assert.Empty(t, again.ContentDisposition)
+		assert.Empty(t, again.ContentEncoding)
+		assert.Empty(t, again.ContentLanguage)
+		assert.Nil(t, again.Metadata)
+		plainSum := md5.Sum(plain)
+		assert.Equal(t, plainSum[:], again.MD5)
+
+		// A copy keeps every attribute, under an ETag of its own.
+		require.NoError(t, b.WriteAll(ctx, "kept", content, opts))
+		attrs, err = b.Attributes(ctx, "kept")
+		require.NoError(t, err)
+		require.NoError(t, b.Copy(ctx, "kept-copy", "kept", nil))
+		copied, err := b.Attributes(ctx, "kept-copy")
+		require.NoError(t, err)
+		assert.NotEqual(t, attrs.ETag, copied.ETag)
+		kept := func(a *blob.Attributes) []any {
+			return []any{a.ContentType, a.CacheControl, a.ContentDisposition, a.ContentEncoding, a.ContentLanguage,
+				a.Metadata, a.MD5, a.Size}
+		}
+		assert.Equal(t, kept(attrs), kept(copied))
+		assert.Equal(t, content, mustRead(t, b, "kept-copy"))
+	})
+}
+
+func TestKeyWithNULRefused(t *testing.T) {
 	db := testDB(t)
 	reset(t, db)
 	b := newBucket(t, db)
 	ctx := context.Background()
 
-	for name, opts := range map[string]*blob.WriterOptions{
-		"metadata":            {Metadata: map[string]string{"owner": "someone"}},
-		"content disposition": {ContentDisposition: "attachment"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			key := "refused/" + name
-			err := b.WriteAll(ctx, key, []byte("x"), opts)
-			require.Error(t, err)
-			assert.Equal(t, gcerrors.Unimplemented, gcerrors.Code(err))
-			_, err = b.Attributes(ctx, key)
-			assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
-		})
+	// The SDK refuses a key that is not UTF-8. U+0000 is UTF-8, but a
+	// PostgreSQL text value cannot hold it, so the driver refuses it with the
+	// same code instead of passing on the database's error.
+	const key = "nul\x00key"
+	require.NoError(t, b.WriteAll(ctx, "plain", []byte("x"), nil))
+	invalid := map[string]error{
+		"empty key":  b.WriteAll(ctx, "", []byte("x"), nil),
+		"write":      b.WriteAll(ctx, key, []byte("x"), nil),
+		"copy to":    b.Copy(ctx, key, "plain", nil),
+		"copy from":  b.Copy(ctx, "plain-copy", key, nil),
+		"delete":     b.Delete(ctx, key),
+		"header":     b.WriteAll(ctx, "header", []byte("x"), &blob.WriterOptions{CacheControl: "no\x00cache"}),
+		"attributes": func() error { _, err := b.Attributes(ctx, key); return err }(),
+		"read":       func() error { _, err := b.NewReader(ctx, key, nil); return err }(),
 	}
+	for name, err := range invalid {
+		require.Error(t, err, name)
+		assert.Equal(t, gcerrors.InvalidArgument, gcerrors.Code(err), name)
+	}
+	_, err := b.Attributes(ctx, "header")
+	assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err), "a refused write left an object behind")
 
-	_, err := b.SignedURL(ctx, "anything", nil)
+	objects, next, err := b.ListPage(ctx, blob.FirstPageToken, 10, &blob.ListOptions{Prefix: "nul\x00"})
+	require.NoError(t, err)
+	assert.Empty(t, objects)
+	assert.Empty(t, next)
+}
+
+func TestSignedURLUnimplemented(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	b := newBucket(t, db)
+
+	_, err := b.SignedURL(context.Background(), "anything", nil)
 	require.Error(t, err)
 	assert.Equal(t, gcerrors.Unimplemented, gcerrors.Code(err))
 }

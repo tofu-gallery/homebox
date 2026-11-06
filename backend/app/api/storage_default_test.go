@@ -44,6 +44,14 @@ func TestApplyDefaultStorage(t *testing.T) {
 			config: "file:///./",
 			want:   "file:///./",
 		},
+		{
+			// setupDatabase reads the driver in lower case, so this one is on
+			// PostgreSQL too.
+			name:   "postgres in capitals uses the database",
+			driver: "Postgres",
+			config: "file:///./",
+			want:   postgresblob.Scheme + "://",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

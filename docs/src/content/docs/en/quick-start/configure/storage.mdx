@@ -4,9 +4,9 @@ title: Storage
 Homebox supports multiple storage backends for flexibility in deployment models.
 
 > [!NOTE]
-> Tofu (2026-11-05): in this fork's image, when `DATABASE_URL` is set, storage defaults to the app's PostgreSQL
-> database through the `postgresblob://` scheme instead of local storage, so item photos and attachments survive
-> container restarts and deploys. Setting `HBOX_STORAGE_CONN_STRING` to any backend on this page still overrides it.
+> Tofu (2026-11-05): in this fork's image, when the app runs on the PostgreSQL database of a `postgres://`
+> `DATABASE_URL`, storage defaults to that database through the `postgresblob://` scheme instead of local storage, so
+> item photos and attachments survive container restarts and deploys. Setting `HBOX_STORAGE_CONN_STRING` to any backend on this page still overrides it.
 > See `TOFU.md` ("Item photos and attachments").
 
 ## Local Storage

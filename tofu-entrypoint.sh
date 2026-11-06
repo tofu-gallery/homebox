@@ -18,9 +18,11 @@ if [ -n "${PORT:-}" ]; then
 	export HBOX_WEB_PORT
 fi
 
+database_url_mapped=
 if [ -n "${DATABASE_URL:-}" ]; then
 	case $DATABASE_URL in
 	postgres://* | postgresql://*)
+		database_url_mapped=yes
 		# postgresql://user:password@host:port/database?sslmode=require
 		rest=${DATABASE_URL#*://}
 
@@ -95,12 +97,19 @@ if [ -n "${DATABASE_URL:-}" ]; then
 	esac
 fi
 
-# Tofu (2026-11-05): with no database the app falls back to SQLite under /data, and storage stays on /data too. With
-# DATABASE_URL set, the server itself defaults storage to that PostgreSQL database (postgresblob://), so item photos
-# and attachments survive restarts and deploys. An HBOX_STORAGE_CONN_STRING the owner sets always wins.
-if [ -z "${HBOX_STORAGE_CONN_STRING:-}" ] && [ -z "${DATABASE_URL:-}" ]; then
-	HBOX_STORAGE_CONN_STRING=file:///?no_tmp_dir=true
-	export HBOX_STORAGE_CONN_STRING
+# Tofu (2026-11-05): when the app runs on the PostgreSQL database of a postgres:// DATABASE_URL, the server itself
+# defaults storage to that database (postgresblob://), so item photos and attachments survive restarts and deploys.
+# Otherwise (no DATABASE_URL, one that is not a postgres:// URL, or an HBOX_DATABASE_DRIVER the owner set to another
+# driver) storage stays where the image always kept it: file:///?no_tmp_dir=true under /data. An
+# HBOX_STORAGE_CONN_STRING the owner sets always wins.
+if [ -z "${HBOX_STORAGE_CONN_STRING:-}" ]; then
+	case "$database_url_mapped:$(printf '%s' "${HBOX_DATABASE_DRIVER:-}" | tr '[:upper:]' '[:lower:]')" in
+	yes:postgres) ;;
+	*)
+		HBOX_STORAGE_CONN_STRING=file:///?no_tmp_dir=true
+		export HBOX_STORAGE_CONN_STRING
+		;;
+	esac
 fi
 
 # Homebox refuses to start without a 32-byte pepper for API keys. Tofu does not supply one; derive it from the
