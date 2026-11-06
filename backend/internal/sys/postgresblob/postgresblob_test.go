@@ -35,6 +35,14 @@ import (
 
 var tables = []string{ObjectsTable, ChunksTable}
 
+const (
+	textPlain = "text/plain"
+
+	// The two ways a key can change under a reader.
+	deleted     = "deleted"
+	overwritten = "overwritten"
+)
+
 func testDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -274,13 +282,13 @@ func TestRoundTripSmallAndLarge(t *testing.T) {
 
 	t.Run("small", func(t *testing.T) {
 		want := []byte("a small attachment")
-		require.NoError(t, b.WriteAll(ctx, "small", want, &blob.WriterOptions{ContentType: "text/plain"}))
+		require.NoError(t, b.WriteAll(ctx, "small", want, &blob.WriterOptions{ContentType: textPlain}))
 		assert.Equal(t, want, mustRead(t, b, "small"))
 
 		attrs, err := b.Attributes(ctx, "small")
 		require.NoError(t, err)
 		assert.EqualValues(t, len(want), attrs.Size)
-		assert.Equal(t, "text/plain", attrs.ContentType)
+		assert.Equal(t, textPlain, attrs.ContentType)
 
 		rows, size, _ := chunkRows(t, db, "small")
 		assert.Equal(t, 1, rows)
@@ -289,7 +297,7 @@ func TestRoundTripSmallAndLarge(t *testing.T) {
 
 	t.Run("large", func(t *testing.T) {
 		want := noise(1, 9<<20+17) // three chunks: 4 MiB, 4 MiB and the rest
-		require.NoError(t, b.WriteAll(ctx, "large", want, &blob.WriterOptions{ContentType: "application/octet-stream"}))
+		require.NoError(t, b.WriteAll(ctx, "large", want, &blob.WriterOptions{ContentType: defaultContentType}))
 		assert.Equal(t, want, mustRead(t, b, "large"))
 
 		rows, size, contents := chunkRows(t, db, "large")
@@ -411,7 +419,7 @@ func TestRangeRead(t *testing.T) {
 		{name: "length past int4", offset: 2, length: math.MaxInt64, want: content[2:]},
 	}
 	buckets(t, db, func(t *testing.T, b *blob.Bucket, _ bool) {
-		require.NoError(t, b.WriteAll(ctx, "range", []byte(content), &blob.WriterOptions{ContentType: "text/plain"}))
+		require.NoError(t, b.WriteAll(ctx, "range", []byte(content), &blob.WriterOptions{ContentType: textPlain}))
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				r, err := b.NewRangeReader(ctx, "range", tt.offset, tt.length, nil)
@@ -537,7 +545,7 @@ func TestFailedWriteLeavesNothing(t *testing.T) {
 		t.Run(key, func(t *testing.T) {
 			before, _, _ := chunkRows(t, db, key)
 			writeCtx, cancel := context.WithCancel(ctx)
-			w, err := b.NewWriter(writeCtx, key, &blob.WriterOptions{ContentType: "text/plain"})
+			w, err := b.NewWriter(writeCtx, key, &blob.WriterOptions{ContentType: textPlain})
 			require.NoError(t, err)
 			// Four whole chunks go to the database inside the writer's
 			// transaction before it is cancelled.
@@ -574,7 +582,7 @@ func TestConcurrentWriters(t *testing.T) {
 
 	write := func(key string, data []byte) {
 		<-start
-		errs <- b.WriteAll(ctx, key, data, &blob.WriterOptions{ContentType: "application/octet-stream"})
+		errs <- b.WriteAll(ctx, key, data, &blob.WriterOptions{ContentType: defaultContentType})
 	}
 	go write(keyA, wantA)
 	go write(keyB, wantB)
@@ -629,7 +637,7 @@ func TestReaderDuringWrite(t *testing.T) {
 	newContent := bytes.Repeat([]byte("n"), 60)
 	require.NoError(t, b.WriteAll(ctx, key, oldContent, nil))
 
-	w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "application/octet-stream"})
+	w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: defaultContentType})
 	require.NoError(t, err)
 
 	// The new chunks are in the database but not committed: a reader sees the
@@ -664,7 +672,7 @@ func TestReaderWhileWriterCloses(t *testing.T) {
 		}
 		require.NoError(t, b.WriteAll(ctx, key, oldContent, nil))
 
-		w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "application/octet-stream"})
+		w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: defaultContentType})
 		require.NoError(t, err)
 		_, err = w.Write(newContent)
 		require.NoError(t, err)
@@ -726,7 +734,7 @@ func TestDeleteDuringRead(t *testing.T) {
 	// that commits part way makes the next piece fail with
 	// FailedPrecondition; every byte before it is the version the reader was
 	// opened on.
-	for _, change := range []string{"deleted", "overwritten"} {
+	for _, change := range []string{deleted, overwritten} {
 		t.Run("short read, "+change, func(t *testing.T) {
 			b := newBucket(t, db)
 			key := "short-" + change
@@ -741,7 +749,7 @@ func TestDeleteDuringRead(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, want[:100], prefix)
 
-			if change == "deleted" {
+			if change == deleted {
 				require.NoError(t, b.Delete(ctx, key))
 			} else {
 				require.NoError(t, b.WriteAll(ctx, key, noise(7, 1<<20), nil))
@@ -757,7 +765,7 @@ func TestDeleteDuringRead(t *testing.T) {
 
 	// A long range reads inside one snapshot: a change that commits after its
 	// first Read changes nothing it returns.
-	for _, change := range []string{"deleted", "overwritten"} {
+	for _, change := range []string{deleted, overwritten} {
 		t.Run("read in a snapshot, "+change, func(t *testing.T) {
 			b := newSmallBucket(t, db)
 			key := "snapshot-" + change
@@ -770,7 +778,7 @@ func TestDeleteDuringRead(t *testing.T) {
 			_, err = io.ReadFull(r, prefix)
 			require.NoError(t, err)
 
-			if change == "deleted" {
+			if change == deleted {
 				require.NoError(t, b.Delete(ctx, key))
 			} else {
 				require.NoError(t, b.WriteAll(ctx, key, bytes.Repeat([]byte("x"), 61), nil))
@@ -819,7 +827,7 @@ func TestChangeBeforeFirstRead(t *testing.T) {
 	ctx := context.Background()
 
 	buckets(t, db, func(t *testing.T, b *blob.Bucket, _ bool) {
-		for _, change := range []string{"deleted", "overwritten"} {
+		for _, change := range []string{deleted, overwritten} {
 			t.Run(change, func(t *testing.T) {
 				key := "opened-then-" + change
 				require.NoError(t, b.WriteAll(ctx, key, pattern(60), nil))
@@ -827,7 +835,7 @@ func TestChangeBeforeFirstRead(t *testing.T) {
 				require.NoError(t, err)
 				defer func() { _ = r.Close() }()
 
-				if change == "deleted" {
+				if change == deleted {
 					require.NoError(t, b.Delete(ctx, key))
 				} else {
 					require.NoError(t, b.WriteAll(ctx, key, bytes.Repeat([]byte("x"), 61), nil))
@@ -849,7 +857,7 @@ func TestIfNotExist(t *testing.T) {
 	ctx := context.Background()
 
 	first := []byte("the first content, in three chunks")
-	opts := &blob.WriterOptions{ContentType: "text/plain", IfNotExist: true}
+	opts := &blob.WriterOptions{ContentType: textPlain, IfNotExist: true}
 	require.NoError(t, b.WriteAll(ctx, "conditional", first, opts))
 	rowsBefore, _, _ := chunkRows(t, db, "conditional")
 
@@ -1055,7 +1063,7 @@ func TestHTTPRangeReadsLittle(t *testing.T) {
 
 	const key, size = "group/documents/photo", 10 << 20
 	want := noise(9, size)
-	require.NoError(t, b.WriteAll(ctx, key, want, &blob.WriterOptions{ContentType: "application/octet-stream"}))
+	require.NoError(t, b.WriteAll(ctx, key, want, &blob.WriterOptions{ContentType: defaultContentType}))
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		file, err := b.NewReader(r.Context(), key, nil)
@@ -1179,7 +1187,8 @@ func TestListPagesWhileKeysChange(t *testing.T) {
 	}
 	rest := func(prefix, delimiter string, token []byte) []string {
 		var keys []string
-		for len(token) > 0 {
+		for pages := 0; len(token) > 0; pages++ {
+			require.Less(t, pages, 10, "the listing does not end")
 			got, next := page(prefix, delimiter, token)
 			keys = append(keys, got...)
 			token = next
@@ -1242,7 +1251,8 @@ func TestListByteOrder(t *testing.T) {
 	list := func(b *blob.Bucket, delimiter string) []string {
 		var got []string
 		token := blob.FirstPageToken
-		for {
+		for pages := 0; ; pages++ {
+			require.Less(t, pages, 10, "the listing does not end")
 			objects, next, err := b.ListPage(ctx, token, 2, &blob.ListOptions{Prefix: "o/", Delimiter: delimiter})
 			require.NoError(t, err)
 			for _, object := range objects {
@@ -1322,7 +1332,10 @@ func TestWritesWhenTheDefaultIsRepeatableRead(t *testing.T) {
 	t.Cleanup(func() { _ = rr.Close() })
 	var isolation string
 	require.NoError(t, rr.QueryRowContext(ctx, `SHOW default_transaction_isolation`).Scan(&isolation))
-	require.Equal(t, "repeatable read", isolation)
+	if isolation != "repeatable read" {
+		// A pooler such as PgBouncer can drop a connection's settings.
+		t.Skipf("default_transaction_isolation=repeatable read did not reach the server (it is %q)", isolation)
+	}
 	b := newSmallBucket(t, rr)
 
 	// holdRow locks the key's row in another transaction, starts op, waits
@@ -1342,7 +1355,7 @@ func TestWritesWhenTheDefaultIsRepeatableRead(t *testing.T) {
 
 	t.Run("a write that commits after another write to its key", func(t *testing.T) {
 		const key = "rr/write"
-		w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "text/plain"})
+		w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: textPlain})
 		require.NoError(t, err)
 		mine := bytes.Repeat([]byte("1"), 10)
 		_, err = w.Write(mine) // one chunk sent: the writer's transaction has its snapshot
