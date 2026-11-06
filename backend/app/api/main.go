@@ -101,7 +101,7 @@ func applyDefaultStorage(cfg *config.Config) {
 
 // registerBlobStorage hands the app's own database pool to the postgresblob
 // driver when the configured storage uses its URL scheme. The driver creates
-// its table at this point, before the first request.
+// its tables at this point, before the first request.
 func registerBlobStorage(ctx context.Context, cfg *config.Config, c *ent.Client) error {
 	if !strings.HasPrefix(cfg.Storage.ConnString, postgresblob.Scheme+"://") {
 		return nil
