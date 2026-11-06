@@ -95,6 +95,14 @@ if [ -n "${DATABASE_URL:-}" ]; then
 	esac
 fi
 
+# Tofu (2026-11-05): with no database the app falls back to SQLite under /data, and storage stays on /data too. With
+# DATABASE_URL set, the server itself defaults storage to that PostgreSQL database (postgresblob://), so item photos
+# and attachments survive restarts and deploys. An HBOX_STORAGE_CONN_STRING the owner sets always wins.
+if [ -z "${HBOX_STORAGE_CONN_STRING:-}" ] && [ -z "${DATABASE_URL:-}" ]; then
+	HBOX_STORAGE_CONN_STRING=file:///?no_tmp_dir=true
+	export HBOX_STORAGE_CONN_STRING
+fi
+
 # Homebox refuses to start without a 32-byte pepper for API keys. Tofu does not supply one; derive it from the
 # database URL so a copy starts without the owner having to set anything. Changing DATABASE_URL (for example after a
 # database restore) invalidates API keys but leaves sign-in sessions alone. An owner-set pepper always wins.

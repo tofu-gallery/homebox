@@ -22,6 +22,7 @@ import (
 	"github.com/sysadminsmedia/homebox/backend/internal/sys/analytics"
 	"github.com/sysadminsmedia/homebox/backend/internal/sys/config"
 	"github.com/sysadminsmedia/homebox/backend/internal/sys/otel"
+	"github.com/sysadminsmedia/homebox/backend/internal/sys/postgresblob"
 	"github.com/sysadminsmedia/homebox/backend/internal/sys/validate"
 	"github.com/sysadminsmedia/homebox/backend/internal/web/mid"
 	"github.com/sysadminsmedia/homebox/backend/pkgs/hasher"
@@ -79,6 +80,42 @@ func validatePostgresSSLMode(sslMode string) bool {
 	return validModes[strings.ToLower(strings.TrimSpace(sslMode))]
 }
 
+// applyDefaultStorage makes the app's PostgreSQL database the default home for
+// item photos and attachments. Tofu (2026-11-05): Tofu gives a container a
+// fresh disk on every start, so the old default (a fileblob bucket under
+// /data) lost every photo and attachment on a restart or deploy. A copy's
+// database survives both.
+//
+// Only Homebox's own built-in default is replaced: a value in
+// HBOX_STORAGE_CONN_STRING, or a non-default value in the config file, still
+// wins, so an owner who pointed storage at a bucket keeps that bucket.
+func applyDefaultStorage(cfg *config.Config) {
+	if cfg.Database.Driver != config.DriverPostgres || os.Getenv("HBOX_STORAGE_CONN_STRING") != "" {
+		return
+	}
+	if cfg.Storage.ConnString != "file:///./" {
+		return
+	}
+	cfg.Storage.ConnString = postgresblob.Scheme + "://"
+}
+
+// registerBlobStorage hands the app's own database pool to the postgresblob
+// driver when the configured storage uses its URL scheme. The driver creates
+// its table at this point, before the first request.
+func registerBlobStorage(ctx context.Context, cfg *config.Config, c *ent.Client) error {
+	if !strings.HasPrefix(cfg.Storage.ConnString, postgresblob.Scheme+"://") {
+		return nil
+	}
+	if cfg.Database.Driver != config.DriverPostgres {
+		return fmt.Errorf("storage %s requires the postgres database driver, not %s",
+			cfg.Storage.ConnString, cfg.Database.Driver)
+	}
+	if err := postgresblob.RegisterPool(ctx, c.Sql()); err != nil {
+		return fmt.Errorf("register %s storage: %w", postgresblob.Scheme, err)
+	}
+	return nil
+}
+
 //	@title						Homebox API
 //	@version					1.0
 //	@description				Track, Manage, and Organize your Things.
@@ -112,6 +149,8 @@ func main() {
 }
 
 func run(cfg *config.Config) error {
+	applyDefaultStorage(cfg)
+
 	app := new(cfg)
 	app.setupLogger()
 
@@ -157,6 +196,10 @@ func run(cfg *config.Config) error {
 			log.Error().Err(err).Msg("failed to close database connection")
 		}
 	}(c)
+
+	if err := registerBlobStorage(context.Background(), cfg, c); err != nil {
+		return err
+	}
 
 	collectFuncs, err := loadCurrencies(cfg)
 	if err != nil {

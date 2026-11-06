@@ -68,7 +68,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Production stage
 FROM mirror.gcr.io/library/alpine:latest
 ENV HBOX_MODE=production
-ENV HBOX_STORAGE_CONN_STRING=file:///?no_tmp_dir=true
+# Tofu (2026-11-05): HBOX_STORAGE_CONN_STRING is no longer set here. With DATABASE_URL set, the server defaults storage
+# to its PostgreSQL database (postgresblob://), so item photos and attachments survive restarts and deploys; without a
+# database, tofu-entrypoint.sh keeps the old file:/// setting under /data. A value the owner sets always wins.
 ENV HBOX_STORAGE_PREFIX_PATH=data
 ENV HBOX_DATABASE_SQLITE_PATH=/data/homebox.db?_pragma=busy_timeout=2000&_pragma=journal_mode=WAL&_fk=1&_time_format=sqlite
 # Tofu (2026-10-23): thumbnails and the hourly GitHub release check are off by default on Tofu
