@@ -510,3 +510,27 @@ func TestAttachmentRepo_FilesystemRootBucket(t *testing.T) {
 
 	require.NoError(t, bucket.Delete(ctx, key))
 }
+
+// Tofu (2026-11-06): an attachment whose file is already gone, as on a copy
+// whose storage did not survive a restart, can still be deleted.
+func TestAttachmentRepo_DeleteWhenTheFileIsGone(t *testing.T) {
+	ctx := context.Background()
+	entity := useEntities(t, 1)[0]
+
+	// Content of its own, so that no other attachment shares the file.
+	att, err := tRepos.Attachments.Create(ctx, entity.ID,
+		ItemCreateAttachment{Title: "gone.txt", Content: strings.NewReader("gone " + uuid.NewString())},
+		attachment.TypeAttachment, false)
+	require.NoError(t, err)
+
+	bucket, err := blob.OpenBucket(ctx, tRepos.Attachments.GetConnString())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bucket.Close() })
+	key := tRepos.Attachments.GetFullPath(att.Path)
+	require.NoError(t, bucket.Delete(ctx, key))
+
+	require.NoError(t, tRepos.Attachments.Delete(ctx, tGroup.ID, att.ID))
+	_, err = tRepos.Attachments.Get(ctx, tGroup.ID, att.ID)
+	require.Error(t, err, "the attachment row is still there")
+	assert.True(t, ent.IsNotFound(err))
+}

@@ -40,6 +40,7 @@ import (
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/memblob"
 	_ "gocloud.dev/blob/s3blob"
+	"gocloud.dev/gcerrors"
 
 	"gocloud.dev/pubsub"
 	_ "gocloud.dev/pubsub/awssnssqs"
@@ -599,7 +600,8 @@ func (r *AttachmentRepo) Delete(ctx context.Context, gid uuid.UUID, id uuid.UUID
 				return err
 			}
 			err = thumbBucket.Delete(ctx, r.fullPath(thumb.Path))
-			if err != nil {
+			// Tofu (2026-11-06): a file that is gone already counts as deleted, as for the bucket.Delete below.
+			if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
 				return err
 			}
 			_ = doc.Update().SetNillableThumbnailID(nil).SaveX(ctx)
@@ -621,7 +623,11 @@ func (r *AttachmentRepo) Delete(ctx context.Context, gid uuid.UUID, id uuid.UUID
 			}
 		}(bucket)
 		err = bucket.Delete(ctx, r.fullPath(doc.Path))
-		if err != nil {
+		// Tofu (2026-11-06): a file that is gone already counts as deleted, as in the export cleanup
+		// (recurring.go), so the attachment row can still be deleted. On Tofu, storage that did not
+		// survive a restart (an earlier pin's /data, or a database's tables after the owner moved
+		// storage to a bucket) leaves rows whose file is missing.
+		if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
 			return err
 		}
 	}
