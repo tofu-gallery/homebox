@@ -30,18 +30,22 @@
 // object; a write that fails, is cancelled or is cut off by a crash rolls back
 // and leaves nothing behind.
 //
-// A reader reads the key's row when it is opened and the bytes at its first
-// Read: a range of up to EagerReadLimit bytes with one statement, served from
-// memory after that, and a longer range one chunk at a time inside a read-only
-// REPEATABLE READ transaction. Either way a read returns one version of the
-// object whole. A delete or overwrite that commits after the first Read
-// changes nothing the reader returns; one that commits between opening the
-// reader and its first Read makes that Read fail with FailedPrecondition.
+// A reader reads the key's row when it is opened, and the bytes from its first
+// Read on, in pieces that never cross a chunk: the first piece is what that
+// Read asks for and at least 64 KiB, and each later one at least twice the one
+// before, up to a whole chunk. A range of up to ShortReadLimit bytes reads
+// each piece with a statement of its own; a longer one reads them all inside
+// one read-only REPEATABLE READ transaction. No read returns bytes of two
+// versions of an object. A delete or overwrite that commits while a short
+// range is read makes its next piece fail with FailedPrecondition. A long
+// range fails that way only when the change commits before its first Read;
+// one that commits later changes nothing it returns.
 //
 // A key may be any UTF-8 string except one that contains U+0000, which a
 // PostgreSQL text value cannot hold; every operation refuses such a key with
-// InvalidArgument. SignedURL returns Unimplemented: PostgreSQL has no address
-// a client could fetch an object from.
+// InvalidArgument. Keys sort and compare in UTF-8 byte order whatever the
+// database's default collation. SignedURL returns Unimplemented: PostgreSQL
+// has no address a client could fetch an object from.
 package postgresblob
 
 import (
@@ -55,10 +59,10 @@ import (
 	"io"
 	"math"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"gocloud.dev/blob"
@@ -80,15 +84,26 @@ const (
 	// inserts.
 	ChunkSize = 4 << 20
 
-	// EagerReadLimit is the longest range read with one statement and served
-	// from memory. It is above Homebox's default 10 MB upload limit, so an
-	// ordinary photo or attachment download holds no transaction open; a
-	// backup download or a staged restore is streamed instead.
-	EagerReadLimit = 16 << 20
+	// ShortReadLimit is the longest range a reader reads without a
+	// transaction, each piece with a statement of its own, so that a download
+	// holds no connection while the client takes its bytes. It is above
+	// Homebox's default 10 MB upload limit, so every photo or attachment up to
+	// that limit is a short read; a backup download or a staged restore is
+	// read inside one snapshot instead.
+	ShortReadLimit = 16 << 20
 
-	// streamIdleTimeout bounds how long a streamed read's snapshot may sit
-	// idle between two chunks while its caller, a browser downloading a
-	// backup for example, takes the last one. It replaces the server's
+	// firstFetch is the least a reader's first piece asks for; each later
+	// piece asks for twice as much as the one before, up to a chunk. After a
+	// Seek the blob SDK reopens its reader from the new offset to the end of
+	// the object, which is what an HTTP byte range becomes, so the reader
+	// never learns how much its caller wants. This keeps a range of a few
+	// bytes to one piece of 64 KiB, and a whole object to a few statements
+	// more than it has chunks.
+	firstFetch = 64 << 10
+
+	// streamIdleTimeout bounds how long a long range's snapshot may sit idle
+	// between two pieces while its caller, a browser downloading a backup for
+	// example, takes the last one. It replaces the server's
 	// idle_in_transaction_session_timeout for that transaction only: a
 	// stricter server setting does not cut a slow download off, and a
 	// snapshot left open holds back vacuum for no longer than this.
@@ -106,11 +121,16 @@ const (
 )
 
 const (
+	// Both key columns use the C collation, so keys sort and compare in UTF-8
+	// byte order, as the blob driver contract asks, whatever the database's
+	// default collation; under C, the primary key's index also serves a
+	// listing's starts_with as a range and returns it in order.
+	//
 	// metadata holds the object's metadata as a JSON object, or '' when it has
 	// none. It is text rather than jsonb because jsonb cannot hold U+0000,
 	// which a metadata key or value may contain.
 	createObjectsSQL = `CREATE TABLE IF NOT EXISTS ` + ObjectsTable + ` (
-	"key" text PRIMARY KEY,
+	"key" text COLLATE "C" PRIMARY KEY,
 	content_id uuid NOT NULL,
 	content_type text NOT NULL,
 	cache_control text NOT NULL DEFAULT '',
@@ -128,7 +148,7 @@ const (
 	// The chunks carry their key, so that a write can delete every chunk of
 	// its key but its own without first reading which content it replaces.
 	createChunksSQL = `CREATE TABLE IF NOT EXISTS ` + ChunksTable + ` (
-	"key" text NOT NULL,
+	"key" text COLLATE "C" NOT NULL,
 	content_id uuid NOT NULL,
 	seq integer NOT NULL CHECK (seq >= 0),
 	data bytea NOT NULL,
@@ -146,13 +166,16 @@ WHERE c.oid IN (to_regclass($1), to_regclass($2)) AND NOT c.relrowsecurity
 	content_language, metadata, md5, size, chunk_size, created_at, mod_time
 FROM ` + ObjectsTable + ` WHERE "key" = $1`
 
-	// chunkRangeSQL joins chunks $3 to $4 of one content in one statement.
-	// Its snapshot holds either every chunk of that content or, once a delete
-	// or overwrite of the key has committed, none of them.
-	chunkRangeSQL = `SELECT string_agg(data, ''::bytea ORDER BY seq) FROM ` + ChunksTable + `
-WHERE "key" = $1 AND content_id = $2::uuid AND seq BETWEEN $3::int AND $4::int`
+	// pieceSQL reads $5 bytes of chunk $3 of one content, from byte $4 of the
+	// chunk on (counted from 1). A chunk is never changed once written, so
+	// every piece of a content is from the same bytes, or the chunk is gone
+	// with its content. Where PostgreSQL keeps a chunk uncompressed, as it
+	// keeps the bytes of a photo or of any other file that is compressed
+	// already, substring reads only the part of the stored value it returns.
+	pieceSQL = `SELECT substring(data FROM $4::int FOR $5::int) FROM ` + ChunksTable + `
+WHERE "key" = $1 AND content_id = $2::uuid AND seq = $3::int`
 
-	chunkSQL = `SELECT data FROM ` + ChunksTable + ` WHERE "key" = $1 AND content_id = $2::uuid AND seq = $3::int`
+	contentIDSQL = `SELECT content_id::text FROM ` + ObjectsTable + ` WHERE "key" = $1`
 
 	insertChunkSQL = `INSERT INTO ` + ChunksTable + ` ("key", content_id, seq, data) VALUES ($1, $2::uuid, $3::int, $4)`
 
@@ -207,16 +230,17 @@ SELECT $1, $3::uuid, content_type, cache_control, content_disposition, content_e
 	metadata, md5, size, chunk_size, statement_timestamp(), statement_timestamp()
 FROM src` + replaceObject
 
-	// COLLATE "C" makes ORDER BY and range comparisons use UTF-8 byte order,
-	// which is what the blob driver contract requires; a database's default
-	// collation may order differently.
+	// The key columns are C already; the COLLATE "C" here keeps ORDER BY and
+	// the comparison with the page token in byte order on a table whose key
+	// column has another collation too. $2 is the last key of the page before,
+	// or '' for the first page; no key is empty.
 	listFlatSQL = `SELECT "key", size, mod_time, md5 FROM ` + ObjectsTable + `
-WHERE starts_with("key", $1) AND ($2::text = '' OR "key" COLLATE "C" > $2 COLLATE "C")
+WHERE starts_with("key", $1) AND "key" COLLATE "C" > $2 COLLATE "C"
 ORDER BY "key" COLLATE "C"
 LIMIT $3`
 
-	listAllSQL = `SELECT "key", size, mod_time, md5 FROM ` + ObjectsTable + `
-WHERE starts_with("key", $1)
+	listAfterSQL = `SELECT "key", size, mod_time, md5 FROM ` + ObjectsTable + `
+WHERE starts_with("key", $1) AND "key" COLLATE "C" > $2 COLLATE "C"
 ORDER BY "key" COLLATE "C"`
 )
 
@@ -227,6 +251,15 @@ var (
 
 	// errWriterClosed is returned when Write or Close is called after Close.
 	errWriterClosed = errors.New("postgresblob: writer is already closed")
+
+	// errReaderClosed is returned by a Read after Close.
+	errReaderClosed = fmt.Errorf("postgresblob: reader is closed: %w", gcerrors.ErrFailedPrecondition)
+
+	// readCommitted is the isolation of every transaction that writes. The
+	// writer, Delete and Copy rely on each statement seeing what committed
+	// before it began (see deleteOtherChunksSQL), so they ask for it rather
+	// than take the database's default, which may be REPEATABLE READ.
+	readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 
 	schemeOnce sync.Once
 
@@ -299,7 +332,8 @@ func NewBucket(db *sql.DB) *blob.Bucket {
 }
 
 func newDriverBucket(db *sql.DB, schemaReady bool) *bucket {
-	return &bucket{db: db, chunkSize: ChunkSize, eagerLimit: EagerReadLimit, schemaReady: schemaReady}
+	return &bucket{db: db, chunkSize: ChunkSize, shortLimit: ShortReadLimit, firstFetch: firstFetch,
+		schemaReady: schemaReady}
 }
 
 // ensureSchema creates the tables once per pool and turns row-level security
@@ -310,7 +344,10 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	tx, err := db.BeginTx(ctx, nil)
+	// READ COMMITTED, so that the row-level security read below sees a table
+	// that another start created and committed while this one waited for the
+	// lock.
+	tx, err := db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return fmt.Errorf("postgresblob: begin schema transaction: %w", err)
 	}
@@ -382,7 +419,8 @@ func tablesWithoutRowSecurity(ctx context.Context, tx *sql.Tx) ([]string, error)
 type bucket struct {
 	db         *sql.DB
 	chunkSize  int   // bytes per chunk of a new object; ChunkSize outside tests
-	eagerLimit int64 // longest range read in one statement; EagerReadLimit outside tests
+	shortLimit int64 // longest range read without a snapshot; ShortReadLimit outside tests
+	firstFetch int64 // the least a reader's first piece asks for; firstFetch outside tests
 
 	schemaMu    sync.Mutex
 	schemaReady bool
@@ -502,8 +540,10 @@ func (b *bucket) object(ctx context.Context, key string) (object, error) {
 }
 
 // NewRangeReader implements driver.Bucket. It reads the key's row now and
-// the bytes at the first Read, so a conditional request that the server
-// answers with 304 reads no content.
+// the bytes from the first Read on, so a conditional request that the server
+// answers with 304 reads no content. opts.BeforeRead is called once the
+// object is found, and not at all for a key that is absent, as the driver
+// contract asks.
 func (b *bucket) NewRangeReader(ctx context.Context, key string, offset, length int64, opts *driver.ReaderOptions) (driver.Reader, error) {
 	if offset < 0 {
 		return nil, fmt.Errorf("%w: negative offset %d", gcerrors.ErrInvalidArgument, offset)
@@ -514,17 +554,21 @@ func (b *bucket) NewRangeReader(ctx context.Context, key string, offset, length 
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
-	if err := callBefore(opts.BeforeRead); err != nil {
-		return nil, err
-	}
 	obj, err := b.object(ctx, key)
 	if err != nil {
+		return nil, err
+	}
+	if err := callBefore(opts.BeforeRead); err != nil {
 		return nil, err
 	}
 	start := min(offset, obj.size)
 	end := obj.size
 	if length >= 0 && length < obj.size-start {
 		end = start + length
+	}
+	fetch := b.firstFetch
+	if fetch <= 0 {
+		fetch = firstFetch
 	}
 	return &reader{
 		db:        b.db,
@@ -534,7 +578,8 @@ func (b *bucket) NewRangeReader(ctx context.Context, key string, offset, length 
 		chunkSize: obj.chunkSize,
 		pos:       start,
 		end:       end,
-		stream:    end-start > b.eagerLimit,
+		snapshot:  end-start > b.shortLimit,
+		fetch:     min(fetch, obj.chunkSize),
 		attrs: driver.ReaderAttributes{
 			ContentType: normalizeContentType(obj.contentType),
 			ModTime:     obj.modified,
@@ -550,18 +595,25 @@ type reader struct {
 	contentID string
 	chunkSize int64
 	pos, end  int64 // the next byte to return, and the end of the range (exclusive)
-	stream    bool  // read chunk by chunk in a snapshot, not all at once
+	snapshot  bool  // read every piece inside one REPEATABLE READ transaction
+	fetch     int64 // the least the next piece asks for
 
-	started bool
-	buf     []byte  // bytes fetched and not yet returned
-	tx      *sql.Tx // the snapshot of a streamed read
-	err     error
-	attrs   driver.ReaderAttributes
+	buf   []byte  // fetched and not yet returned
+	tx    *sql.Tx // the snapshot of a long range, from its first piece to the end of the read
+	begun bool    // the snapshot was begun, so a missing tx means it has ended
+	err   error   // returned by every Read from now on
+	attrs driver.ReaderAttributes
 }
 
-// Read implements io.Reader. It fills p across chunk boundaries, as the SDK's
-// conformance suite expects of a driver, and ends a streamed read's snapshot
-// as soon as the range's last byte is returned.
+// querier is what a piece is read through: the pool, or a long range's
+// snapshot.
+type querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// Read implements io.Reader. It fills p across pieces and chunks, as the
+// SDK's conformance suite expects of a driver, and ends a long range's
+// snapshot as soon as the range's last byte is returned.
 func (r *reader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
@@ -576,7 +628,7 @@ func (r *reader) Read(p []byte) (int, error) {
 				}
 				return 0, io.EOF
 			}
-			if err := r.fill(); err != nil {
+			if err := r.fill(int64(len(p) - n)); err != nil {
 				r.err = err
 				r.finish()
 				return n, err
@@ -594,70 +646,74 @@ func (r *reader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// fill fetches the next bytes to return: the whole range on a short read, the
-// next chunk on a streamed one.
-func (r *reader) fill() error {
+// fill fetches the next piece: from the next byte to return, the more of
+// need and r.fetch, but never past the end of its chunk or of the range.
+func (r *reader) fill(need int64) error {
+	q, err := r.source()
+	if err != nil {
+		return err
+	}
 	seq := r.pos / r.chunkSize
-	if !r.stream {
-		if r.started {
-			return r.missing(seq)
-		}
-		r.started = true
-		last := (r.end - 1) / r.chunkSize
-		var data []byte
-		if err := r.db.QueryRowContext(r.ctx, chunkRangeSQL, r.key, r.contentID, seq, last).Scan(&data); err != nil {
-			return fmt.Errorf("postgresblob: read %q: %w", r.key, err)
-		}
-		return r.keep(data, seq, r.end, true)
-	}
-
-	first := !r.started
-	if first {
-		tx, err := r.db.BeginTx(r.ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
-		if err != nil {
-			return fmt.Errorf("postgresblob: read %q: begin: %w", r.key, err)
-		}
-		if _, err := tx.ExecContext(r.ctx, `SELECT set_config('idle_in_transaction_session_timeout', $1, true)`,
-			streamIdleTimeout); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("postgresblob: read %q: %w", r.key, err)
-		}
-		r.tx = tx
-		r.started = true
-	}
+	from := r.pos - seq*r.chunkSize
+	length := min(r.end-r.pos, r.chunkSize-from, max(need, r.fetch))
 	var data []byte
-	err := r.tx.QueryRowContext(r.ctx, chunkSQL, r.key, r.contentID, seq).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		data = nil
-	} else if err != nil {
+	err = q.QueryRowContext(r.ctx, pieceSQL, r.key, r.contentID, seq, from+1, length).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && int64(len(data)) != length) {
+		return r.gone(q, seq)
+	}
+	if err != nil {
 		return fmt.Errorf("postgresblob: read %q: chunk %d: %w", r.key, seq, err)
 	}
-	return r.keep(data, seq, min(r.end, (seq+1)*r.chunkSize), first)
-}
-
-// keep stores the part of data, which begins at chunk seq, that the reader
-// returns next, up to the absolute offset until.
-func (r *reader) keep(data []byte, seq, until int64, first bool) error {
-	if len(data) == 0 {
-		if first {
-			return fmt.Errorf("postgresblob: %q was replaced or deleted after the reader was opened; open it again: %w",
-				r.key, gcerrors.ErrFailedPrecondition)
-		}
-		return r.missing(seq)
-	}
-	from, to := r.pos-seq*r.chunkSize, until-seq*r.chunkSize
-	if from < 0 || to <= from || int64(len(data)) < to {
-		return r.missing(seq)
-	}
-	r.buf = data[from:to]
+	r.buf = data
+	r.fetch = min(2*r.fetch, r.chunkSize)
 	return nil
 }
 
-func (r *reader) missing(seq int64) error {
+// source is the pool for a short range. For a long one it is the snapshot,
+// begun with the first piece. The snapshot sets
+// idle_in_transaction_session_timeout for itself only (streamIdleTimeout).
+func (r *reader) source() (querier, error) {
+	if !r.snapshot {
+		return r.db, nil
+	}
+	if r.tx != nil {
+		return r.tx, nil
+	}
+	if r.begun {
+		return nil, fmt.Errorf("postgresblob: read %q: its snapshot has already ended: %w", r.key, gcerrors.ErrInternal)
+	}
+	r.begun = true
+	tx, err := r.db.BeginTx(r.ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("postgresblob: read %q: begin: %w", r.key, err)
+	}
+	if _, err := tx.ExecContext(r.ctx, `SELECT set_config('idle_in_transaction_session_timeout', $1, true)`,
+		streamIdleTimeout); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("postgresblob: read %q: %w", r.key, err)
+	}
+	r.tx = tx
+	return tx, nil
+}
+
+// gone explains a piece that is missing or shorter than asked for. If the key
+// no longer holds the content the reader was opened on, a delete or overwrite
+// committed in between: FailedPrecondition, and the caller may open the key
+// again. If it still does, the content lacks part of its bytes: Internal.
+func (r *reader) gone(q querier, seq int64) error {
+	var current string
+	err := q.QueryRowContext(r.ctx, contentIDSQL, r.key).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && current != r.contentID) {
+		return fmt.Errorf("postgresblob: %q was replaced or deleted after the reader was opened; open it again: %w",
+			r.key, gcerrors.ErrFailedPrecondition)
+	}
+	if err != nil {
+		return fmt.Errorf("postgresblob: read %q: %w", r.key, err)
+	}
 	return fmt.Errorf("postgresblob: %q is missing part of its content at chunk %d: %w", r.key, seq, gcerrors.ErrInternal)
 }
 
-// finish ends the snapshot of a streamed read.
+// finish ends the snapshot of a long range.
 func (r *reader) finish() {
 	if r.tx != nil {
 		_ = r.tx.Commit()
@@ -665,10 +721,13 @@ func (r *reader) finish() {
 	}
 }
 
-// Close implements driver.Reader.
+// Close implements driver.Reader. A Read after Close returns errReaderClosed.
 func (r *reader) Close() error {
 	r.finish()
 	r.buf = nil
+	if r.err == nil {
+		r.err = errReaderClosed
+	}
 	return nil
 }
 
@@ -685,11 +744,18 @@ func (b *bucket) NewTypedWriter(ctx context.Context, key, contentType string, op
 	if err := checkNewKey(key); err != nil {
 		return nil, err
 	}
+	// The SDK checks the key and the metadata; these values go into text
+	// columns too, which hold only UTF-8 without U+0000. Refusing them here
+	// keeps a write that would fail at Close from sending any chunk.
 	for name, value := range map[string]string{
 		"content type": contentType, "Cache-Control": opts.CacheControl,
 		"Content-Disposition": opts.ContentDisposition, "Content-Encoding": opts.ContentEncoding,
 		"Content-Language": opts.ContentLanguage,
 	} {
+		if !utf8.ValidString(value) {
+			return nil, fmt.Errorf("%w: postgresblob: the %s of %q is not valid UTF-8, which PostgreSQL text needs",
+				gcerrors.ErrInvalidArgument, name, key)
+		}
 		if strings.IndexByte(value, 0) >= 0 {
 			return nil, fmt.Errorf("%w: postgresblob: the %s of %q contains U+0000, which PostgreSQL text cannot hold",
 				gcerrors.ErrInvalidArgument, name, key)
@@ -809,7 +875,7 @@ func (w *writer) begin() error {
 	if w.tx != nil {
 		return nil
 	}
-	tx, err := w.db.BeginTx(w.ctx, nil)
+	tx, err := w.db.BeginTx(w.ctx, readCommitted)
 	if err != nil {
 		return fmt.Errorf("postgresblob: write %q: begin: %w", w.key, err)
 	}
@@ -909,7 +975,7 @@ func (b *bucket) Delete(ctx context.Context, key string, opts *driver.DeleteOpti
 	if err := callBefore(opts.BeforeDelete); err != nil {
 		return err
 	}
-	tx, err := b.db.BeginTx(ctx, nil)
+	tx, err := b.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return fmt.Errorf("postgresblob: delete %q: begin: %w", key, err)
 	}
@@ -952,7 +1018,7 @@ func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.C
 		return err
 	}
 	contentID := uuid.NewString()
-	tx, err := b.db.BeginTx(ctx, nil)
+	tx, err := b.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return fmt.Errorf("postgresblob: copy %q to %q: begin: %w", srcKey, dstKey, err)
 	}
@@ -994,6 +1060,11 @@ func (b *bucket) ListPaged(ctx context.Context, opts *driver.ListOptions) (*driv
 		// No key holds U+0000 (checkKey), so no key has this prefix.
 		return &driver.ListPage{}, nil
 	}
+	// A page token is the last key or directory of the page before, so it is
+	// UTF-8 without U+0000; anything else did not come from this driver.
+	if token := string(opts.PageToken); !utf8.ValidString(token) || strings.IndexByte(token, 0) >= 0 {
+		return nil, fmt.Errorf("%w: postgresblob: bad page token %q", gcerrors.ErrInvalidArgument, opts.PageToken)
+	}
 	if opts.Delimiter != "" {
 		return b.listDelimited(ctx, opts)
 	}
@@ -1031,58 +1102,54 @@ func (b *bucket) listFlat(ctx context.Context, opts *driver.ListOptions) (*drive
 	return &driver.ListPage{Objects: objects, NextPageToken: next}, nil
 }
 
+// listDelimited pages by entry, a key or a directory, in byte order. The page
+// token is the last entry of the page before, as in the flat listing, so a
+// write or delete between two pages never repeats, reorders or skips an
+// entry that was there throughout. Collapsing keys into their directories
+// keeps byte order, and the keys of one directory are next to each other, so
+// an entry is a repeat exactly when it equals the one before it.
 func (b *bucket) listDelimited(ctx context.Context, opts *driver.ListOptions) (*driver.ListPage, error) {
-	rows, err := b.db.QueryContext(ctx, listAllSQL, opts.Prefix)
+	pageSize := opts.PageSize
+	if pageSize <= 0 {
+		pageSize = defaultPageSize
+	}
+	// A key at or before the token belongs to an entry at or before it, since
+	// an entry never sorts after its keys; the query leaves those out.
+	after := string(opts.PageToken)
+	rows, err := b.db.QueryContext(ctx, listAfterSQL, opts.Prefix, after)
 	if err != nil {
 		return nil, fmt.Errorf("postgresblob: list: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	entries := make([]*driver.ListObject, 0)
-	lastDir := ""
+	var next []byte
 	for rows.Next() {
-		object, err := scanListObject(rows)
+		entry, err := scanListObject(rows)
 		if err != nil {
 			return nil, err
 		}
-		rest := strings.TrimPrefix(object.Key, opts.Prefix)
+		rest := strings.TrimPrefix(entry.Key, opts.Prefix)
 		if i := strings.Index(rest, opts.Delimiter); i >= 0 {
-			dir := opts.Prefix + rest[:i+len(opts.Delimiter)]
-			if dir != lastDir {
-				entries = append(entries, &driver.ListObject{Key: dir, IsDir: true})
-				lastDir = dir
-			}
+			entry = &driver.ListObject{Key: opts.Prefix + rest[:i+len(opts.Delimiter)], IsDir: true}
+		}
+		// The directory the page before ended with, or one already on this page.
+		if entry.Key <= after || (len(entries) > 0 && entries[len(entries)-1].Key == entry.Key) {
 			continue
 		}
-		entries = append(entries, object)
+		if len(entries) == pageSize {
+			next = []byte(entries[len(entries)-1].Key)
+			break
+		}
+		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgresblob: list: %w", err)
 	}
-
-	offset := 0
-	if len(opts.PageToken) > 0 {
-		offset, err = strconv.Atoi(string(opts.PageToken))
-		if err != nil || offset < 0 {
-			return nil, fmt.Errorf("%w: bad page token %q", gcerrors.ErrInvalidArgument, opts.PageToken)
-		}
-	}
-	if offset > len(entries) {
-		offset = len(entries)
-	}
-	pageSize := opts.PageSize
-	if pageSize <= 0 || offset+pageSize > len(entries) {
-		pageSize = len(entries) - offset
-	}
-	end := offset + pageSize
-	var next []byte
-	if end < len(entries) {
-		next = []byte(strconv.Itoa(end))
-	}
-	return &driver.ListPage{Objects: entries[offset:end], NextPageToken: next}, nil
+	return &driver.ListPage{Objects: entries, NextPageToken: next}, nil
 }
 
-// scanListObject reads one row of listFlatSQL or listAllSQL.
+// scanListObject reads one row of listFlatSQL or listAfterSQL.
 func scanListObject(rows *sql.Rows) (*driver.ListObject, error) {
 	var object driver.ListObject
 	if err := rows.Scan(&object.Key, &object.Size, &object.ModTime, &object.MD5); err != nil {

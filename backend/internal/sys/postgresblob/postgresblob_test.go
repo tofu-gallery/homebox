@@ -14,18 +14,23 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 var tables = []string{ObjectsTable, ChunksTable}
@@ -41,6 +46,56 @@ func testDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, db.PingContext(context.Background()))
 	return db
+}
+
+// dsnWith is TEST_DATABASE_URL with one more connection parameter; pgx sends
+// a parameter it does not know to the server as a setting for the session.
+func dsnWith(t *testing.T, param string) string {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set; skipping PostgreSQL blob driver tests")
+	}
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + param
+	}
+	return dsn + "?" + param
+}
+
+// countingDB opens a pool on the test database that counts every byte
+// PostgreSQL sends it, so a test can tell how much a read fetched.
+func countingDB(t *testing.T) (*sql.DB, *atomic.Int64) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL is not set; skipping PostgreSQL blob driver tests")
+	}
+	config, err := pgx.ParseConfig(dsn)
+	require.NoError(t, err)
+	received := new(atomic.Int64)
+	dial := config.DialFunc
+	config.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &countingConn{Conn: conn, received: received}, nil
+	}
+	db := stdlib.OpenDB(*config)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(context.Background()))
+	return db, received
+}
+
+type countingConn struct {
+	net.Conn
+	received *atomic.Int64
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.received.Add(int64(n))
+	return n, err
 }
 
 // reset drops the driver's tables so each test starts from a known state and
@@ -77,12 +132,13 @@ func newBucket(t *testing.T, db *sql.DB) *blob.Bucket {
 	return b
 }
 
-// newSmallBucket writes 7-byte chunks and streams every read longer than 20
-// bytes, so a test object of a few dozen bytes takes the same paths that a
-// backup of several hundred megabytes takes with the real sizes.
+// newSmallBucket writes 7-byte chunks, reads a range longer than 20 bytes
+// inside a snapshot and begins every read with a 3-byte piece, so a test
+// object of a few dozen bytes takes the same paths that a backup of several
+// hundred megabytes takes with the real sizes.
 func newSmallBucket(t *testing.T, db *sql.DB) *blob.Bucket {
 	t.Helper()
-	b := blob.NewBucket(&bucket{db: db, chunkSize: 7, eagerLimit: 20})
+	b := blob.NewBucket(&bucket{db: db, chunkSize: 7, shortLimit: 20, firstFetch: 3})
 	t.Cleanup(func() { _ = b.Close() })
 	return b
 }
@@ -301,7 +357,8 @@ func TestLargeObjectIsChunked(t *testing.T) {
 	assert.Equal(t, size/ChunkSize, rows)
 	assert.EqualValues(t, ChunkSize, largest)
 
-	// The whole object is longer than EagerReadLimit, so it is streamed.
+	// The whole object is longer than ShortReadLimit, so it is read inside a
+	// snapshot.
 	r, err := b.NewReader(ctx, key, nil)
 	require.NoError(t, err)
 	got := sha256.New()
@@ -601,7 +658,8 @@ func TestReaderWhileWriterCloses(t *testing.T) {
 		const key = "racing"
 		oldContent, newContent := pattern(1<<20), noise(5, 1<<20+3)
 		if small {
-			// Longer than the small bucket's eager limit, so these are streamed.
+			// Longer than the small bucket's 20-byte limit for a read without
+			// a snapshot, so these are read inside one.
 			oldContent, newContent = pattern(60), bytes.Repeat([]byte("n"), 63)
 		}
 		require.NoError(t, b.WriteAll(ctx, key, oldContent, nil))
@@ -612,9 +670,9 @@ func TestReaderWhileWriterCloses(t *testing.T) {
 		require.NoError(t, err)
 
 		// Read in a loop while the writer commits. Every read must be one of
-		// the two objects, whole; a reader opened just before the commit may
-		// instead fail with FailedPrecondition. A torn read would be a
-		// different length or different bytes.
+		// the two objects, whole; a read the commit lands in may instead fail
+		// with FailedPrecondition. A torn read would be a different length or
+		// different bytes.
 		stop := make(chan struct{})
 		running := make(chan struct{})
 		bad := make(chan string, 1)
@@ -664,36 +722,46 @@ func TestDeleteDuringRead(t *testing.T) {
 	reset(t, db)
 	ctx := context.Background()
 
-	t.Run("short read", func(t *testing.T) {
-		b := newBucket(t, db)
-		const key = "delete-during-read"
-		want := noise(6, 1<<20)
-		require.NoError(t, b.WriteAll(ctx, key, want, nil))
-
-		r, err := b.NewReader(ctx, key, nil)
-		require.NoError(t, err)
-		prefix := make([]byte, 100)
-		_, err = io.ReadFull(r, prefix)
-		require.NoError(t, err)
-		assert.Equal(t, want[:100], prefix)
-
-		require.NoError(t, b.Delete(ctx, key))
-
-		rest, err := io.ReadAll(r)
-		require.NoError(t, err)
-		assert.Equal(t, want[100:], rest)
-		require.NoError(t, r.Close())
-
-		_, err = b.ReadAll(ctx, key)
-		require.Error(t, err)
-		assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
-	})
-
+	// A short range reads each piece with a statement of its own. A change
+	// that commits part way makes the next piece fail with
+	// FailedPrecondition; every byte before it is the version the reader was
+	// opened on.
 	for _, change := range []string{"deleted", "overwritten"} {
-		t.Run("streamed read, "+change, func(t *testing.T) {
+		t.Run("short read, "+change, func(t *testing.T) {
+			b := newBucket(t, db)
+			key := "short-" + change
+			want := noise(6, 1<<20)
+			require.NoError(t, b.WriteAll(ctx, key, want, nil))
+
+			r, err := b.NewReader(ctx, key, nil)
+			require.NoError(t, err)
+			defer func() { _ = r.Close() }()
+			prefix := make([]byte, 100)
+			_, err = io.ReadFull(r, prefix)
+			require.NoError(t, err)
+			assert.Equal(t, want[:100], prefix)
+
+			if change == "deleted" {
+				require.NoError(t, b.Delete(ctx, key))
+			} else {
+				require.NoError(t, b.WriteAll(ctx, key, noise(7, 1<<20), nil))
+			}
+
+			rest, err := io.ReadAll(r)
+			require.Error(t, err, "a short read went on after its object changed")
+			assert.Equal(t, gcerrors.FailedPrecondition, gcerrors.Code(err))
+			require.Less(t, len(rest), len(want)-100)
+			assert.True(t, bytes.Equal(want[100:100+len(rest)], rest), "a short read mixed versions")
+		})
+	}
+
+	// A long range reads inside one snapshot: a change that commits after its
+	// first Read changes nothing it returns.
+	for _, change := range []string{"deleted", "overwritten"} {
+		t.Run("read in a snapshot, "+change, func(t *testing.T) {
 			b := newSmallBucket(t, db)
-			key := "streamed-" + change
-			want := pattern(60) // longer than the small bucket's 20-byte eager limit
+			key := "snapshot-" + change
+			want := pattern(60) // longer than the small bucket's 20-byte limit for a short read
 			require.NoError(t, b.WriteAll(ctx, key, want, nil))
 
 			r, err := b.NewReader(ctx, key, nil)
@@ -711,25 +779,20 @@ func TestDeleteDuringRead(t *testing.T) {
 			rest, err := io.ReadAll(r)
 			require.NoError(t, err)
 			require.NoError(t, r.Close())
-			assert.Equal(t, want, append(prefix, rest...), "a streamed read mixed versions or stopped early")
+			assert.Equal(t, want, append(prefix, rest...), "a read in a snapshot mixed versions or stopped early")
 		})
 	}
 }
 
-func TestSlowStreamedRead(t *testing.T) {
+func TestSlowReadInSnapshot(t *testing.T) {
 	db := testDB(t)
 	reset(t, db)
 	ctx := context.Background()
 
 	// A pool whose server ends any transaction idle for over a second, as a
-	// strict database setting would. A streamed read waits between chunks for
-	// as long as its caller takes; that must not end it.
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	sep := "?"
-	if strings.Contains(dsn, "?") {
-		sep = "&"
-	}
-	strict, err := sql.Open("pgx", dsn+sep+"idle_in_transaction_session_timeout=1000")
+	// strict database setting would. A long range's snapshot waits between
+	// pieces for as long as its caller takes; that must not end it.
+	strict, err := sql.Open("pgx", dsnWith(t, "idle_in_transaction_session_timeout=1000"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = strict.Close() })
 	b := newSmallBucket(t, strict)
@@ -746,7 +809,7 @@ func TestSlowStreamedRead(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	rest, err := io.ReadAll(r)
-	require.NoError(t, err, "a streamed read was ended while its caller was slow")
+	require.NoError(t, err, "a read in a snapshot was ended while its caller was slow")
 	assert.Equal(t, want, append(head, rest...))
 }
 
@@ -914,21 +977,32 @@ func TestKeyWithNULRefused(t *testing.T) {
 	const key = "nul\x00key"
 	require.NoError(t, b.WriteAll(ctx, "plain", []byte("x"), nil))
 	invalid := map[string]error{
-		"empty key":  b.WriteAll(ctx, "", []byte("x"), nil),
-		"write":      b.WriteAll(ctx, key, []byte("x"), nil),
-		"copy to":    b.Copy(ctx, key, "plain", nil),
-		"copy from":  b.Copy(ctx, "plain-copy", key, nil),
-		"delete":     b.Delete(ctx, key),
-		"header":     b.WriteAll(ctx, "header", []byte("x"), &blob.WriterOptions{CacheControl: "no\x00cache"}),
+		"empty key": b.WriteAll(ctx, "", []byte("x"), nil),
+		"write":     b.WriteAll(ctx, key, []byte("x"), nil),
+		"copy to":   b.Copy(ctx, key, "plain", nil),
+		"copy from": b.Copy(ctx, "plain-copy", key, nil),
+		"delete":    b.Delete(ctx, key),
+		"header":    b.WriteAll(ctx, "header", []byte("x"), &blob.WriterOptions{CacheControl: "no\x00cache"}),
+		// The SDK checks neither header for UTF-8; PostgreSQL text needs it.
+		"header not UTF-8": b.WriteAll(ctx, "header-utf8", []byte("x"),
+			&blob.WriterOptions{CacheControl: "max-age=\xff"}),
+		"disposition not UTF-8": b.WriteAll(ctx, "header-utf8", []byte("x"),
+			&blob.WriterOptions{ContentDisposition: "attachment; filename=\"\xc3\x28\""}),
 		"attributes": func() error { _, err := b.Attributes(ctx, key); return err }(),
 		"read":       func() error { _, err := b.NewReader(ctx, key, nil); return err }(),
+		"page token": func() error {
+			_, _, err := b.ListPage(ctx, []byte("p\xff"), 10, &blob.ListOptions{Prefix: "p"})
+			return err
+		}(),
 	}
 	for name, err := range invalid {
 		require.Error(t, err, name)
 		assert.Equal(t, gcerrors.InvalidArgument, gcerrors.Code(err), name)
 	}
-	_, err := b.Attributes(ctx, "header")
-	assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err), "a refused write left an object behind")
+	for _, refused := range []string{"header", "header-utf8"} {
+		_, err := b.Attributes(ctx, refused)
+		assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err), "a refused write left %s behind", refused)
+	}
 
 	objects, next, err := b.ListPage(ctx, blob.FirstPageToken, 10, &blob.ListOptions{Prefix: "nul\x00"})
 	require.NoError(t, err)
@@ -966,4 +1040,342 @@ func TestURLScheme(t *testing.T) {
 
 	_, err = blob.OpenBucket(ctx, Scheme+"://with-a-host")
 	require.Error(t, err)
+}
+
+// TestHTTPRangeReadsLittle serves an object the way Homebox serves an
+// attachment, through http.ServeContent, and counts the bytes PostgreSQL
+// sends for each request. After a Seek the SDK reopens its reader from the
+// new offset to the end of the object, so the driver is never told how short
+// an HTTP range is; it must still read about what the response sends.
+func TestHTTPRangeReadsLittle(t *testing.T) {
+	db, received := countingDB(t)
+	reset(t, db)
+	b := newBucket(t, db)
+	ctx := context.Background()
+
+	const key, size = "group/documents/photo", 10 << 20
+	want := noise(9, size)
+	require.NoError(t, b.WriteAll(ctx, key, want, &blob.WriterOptions{ContentType: "application/octet-stream"}))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		file, err := b.NewReader(r.Context(), key, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = file.Close() }()
+		http.ServeContent(w, r, r.URL.Query().Get("name"), time.Time{}, file)
+	}))
+	t.Cleanup(server.Close)
+
+	// A generous bound on one 64 KiB piece, the object's row and the protocol.
+	const piece = 256 << 10
+	tests := []struct {
+		name, file, ranges string
+		status             int
+		body               []byte
+		most               int64
+	}{
+		{"first two bytes", "photo.jpg", "bytes=0-1", http.StatusPartialContent, want[:2], piece},
+		{"two bytes in the middle", "photo.jpg", "bytes=5000000-5000001", http.StatusPartialContent,
+			want[5000000:5000002], piece},
+		{"last two bytes", "photo.jpg", "bytes=-2", http.StatusPartialContent, want[size-2:], piece},
+		// For a name whose extension Go does not know, as for a .heic or .mov
+		// attachment, ServeContent first reads 512 bytes to sniff the type and
+		// seeks back, so the SDK opens a second reader.
+		{"two bytes, type sniffed", "photo", "bytes=0-1", http.StatusPartialContent, want[:2], 2 * piece},
+		{"the whole object, type sniffed", "photo", "", http.StatusOK, want, size + 2*piece},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/?name="+tt.file, nil)
+			require.NoError(t, err)
+			if tt.ranges != "" {
+				req.Header.Set("Range", tt.ranges)
+			}
+			received.Store(0)
+			resp, err := server.Client().Do(req)
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			got := received.Load()
+			t.Logf("PostgreSQL sent %d bytes for a response of %d", got, len(body))
+
+			assert.Equal(t, tt.status, resp.StatusCode)
+			assert.True(t, bytes.Equal(tt.body, body), "the response has %d bytes, not the %d asked for", len(body), len(tt.body))
+			assert.LessOrEqual(t, got, tt.most, "PostgreSQL sent %d bytes for a response of %d", got, len(body))
+		})
+	}
+}
+
+func TestReadAfterClose(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	ctx := context.Background()
+
+	// The SDK passes a Read after Close on to the driver. Every reader, the
+	// small bucket's long one with its snapshot included, refuses it.
+	buckets(t, db, func(t *testing.T, b *blob.Bucket, _ bool) {
+		require.NoError(t, b.WriteAll(ctx, "closed", pattern(60), nil))
+		r, err := b.NewReader(ctx, "closed", nil)
+		require.NoError(t, err)
+		head := make([]byte, 10)
+		_, err = io.ReadFull(r, head)
+		require.NoError(t, err)
+		require.NoError(t, r.Close())
+
+		n, err := r.Read(make([]byte, 10))
+		assert.Zero(t, n)
+		require.Error(t, err)
+		assert.Equal(t, gcerrors.FailedPrecondition, gcerrors.Code(err))
+	})
+}
+
+func TestBeforeReadOnlyForAnObject(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	b := newBucket(t, db)
+	ctx := context.Background()
+
+	// The driver contract: BeforeRead is called once before any data is read,
+	// and not at all when NewRangeReader fails first.
+	calls := 0
+	opts := &blob.ReaderOptions{BeforeRead: func(func(any) bool) error { calls++; return nil }}
+	_, err := b.NewReader(ctx, "absent", opts)
+	require.Error(t, err)
+	assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
+	assert.Zero(t, calls, "BeforeRead was called for a key that is absent")
+
+	require.NoError(t, b.WriteAll(ctx, "present", []byte("present"), nil))
+	r, err := b.NewReader(ctx, "present", opts)
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	assert.Equal(t, []byte("present"), got)
+	assert.Equal(t, 1, calls)
+}
+
+func TestListPagesWhileKeysChange(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	b := newBucket(t, db)
+	ctx := context.Background()
+
+	write := func(keys ...string) {
+		for _, key := range keys {
+			require.NoError(t, b.WriteAll(ctx, key, []byte(key), nil))
+		}
+	}
+	page := func(prefix, delimiter string, token []byte) ([]string, []byte) {
+		objects, next, err := b.ListPage(ctx, token, 2, &blob.ListOptions{Prefix: prefix, Delimiter: delimiter})
+		require.NoError(t, err)
+		keys := make([]string, 0, len(objects))
+		for _, object := range objects {
+			keys = append(keys, object.Key)
+		}
+		return keys, next
+	}
+	rest := func(prefix, delimiter string, token []byte) []string {
+		var keys []string
+		for len(token) > 0 {
+			got, next := page(prefix, delimiter, token)
+			keys = append(keys, got...)
+			token = next
+		}
+		return keys
+	}
+
+	// The driver contract: every entry of a later page sorts after every
+	// entry of the pages before it. Entries that were there throughout are
+	// each listed once.
+	for i, delimiter := range []string{"/", ""} {
+		name := "slash delimiter"
+		if delimiter == "" {
+			name = "no delimiter"
+		}
+		t.Run(name, func(t *testing.T) {
+			entry := func(prefix, dir string) string {
+				if delimiter == "" {
+					return prefix + dir + "/1"
+				}
+				return prefix + dir + "/"
+			}
+
+			// A write between two pages, of keys that sort into the first.
+			w := fmt.Sprintf("write%d/", i)
+			write(w+"a/1", w+"b/1", w+"c/1", w+"d/1")
+			first, token := page(w, delimiter, blob.FirstPageToken)
+			require.Equal(t, []string{entry(w, "a"), entry(w, "b")}, first)
+			write(w+"a0/1", w+"a1/1")
+			assert.Equal(t, []string{entry(w, "c"), entry(w, "d")}, rest(w, delimiter, token))
+
+			// A delete between two pages, of an entry of the first.
+			d := fmt.Sprintf("delete%d/", i)
+			write(d+"a/1", d+"b/1", d+"c/1", d+"d/1")
+			first, token = page(d, delimiter, blob.FirstPageToken)
+			require.Equal(t, []string{entry(d, "a"), entry(d, "b")}, first)
+			require.NoError(t, b.Delete(ctx, d+"a/1"))
+			assert.Equal(t, []string{entry(d, "c"), entry(d, "d")}, rest(d, delimiter, token))
+		})
+	}
+}
+
+func TestListByteOrder(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	b := newBucket(t, db)
+	ctx := context.Background()
+
+	// In UTF-8 byte order, which the driver contract asks for, B (0x42) comes
+	// before a (0x61), and é (0xC3 0xA9) after f (0x66). A language's order,
+	// such as ICU's en-US, puts o/a first and o/é before o/f.
+	keys := []string{"o/é/1", "o/a", "o/f", "o/B", "o/ab", "o/é", "o/a-c"}
+	for _, key := range keys {
+		require.NoError(t, b.WriteAll(ctx, key, []byte(key), nil))
+	}
+	flat := slices.Sorted(slices.Values(keys))
+	require.Equal(t, []string{"o/B", "o/a", "o/a-c", "o/ab", "o/f", "o/é", "o/é/1"}, flat)
+	delimited := []string{"o/B", "o/a", "o/a-c", "o/ab", "o/f", "o/é", "o/é/"}
+
+	list := func(b *blob.Bucket, delimiter string) []string {
+		var got []string
+		token := blob.FirstPageToken
+		for {
+			objects, next, err := b.ListPage(ctx, token, 2, &blob.ListOptions{Prefix: "o/", Delimiter: delimiter})
+			require.NoError(t, err)
+			for _, object := range objects {
+				got = append(got, object.Key)
+			}
+			if len(next) == 0 {
+				return got
+			}
+			token = next
+		}
+	}
+
+	t.Run("the key columns are C", func(t *testing.T) {
+		for _, table := range tables {
+			var collation string
+			require.NoError(t, db.QueryRowContext(ctx, `SELECT c.collname FROM pg_attribute a
+JOIN pg_collation c ON c.oid = a.attcollation
+WHERE a.attrelid = to_regclass($1) AND a.attname = 'key'`, table).Scan(&collation))
+			assert.Equal(t, "C", collation, "the key column of %s", table)
+		}
+		assert.Equal(t, flat, list(b, ""))
+		assert.Equal(t, delimited, list(b, "/"))
+	})
+
+	t.Run("a key column in a language's order", func(t *testing.T) {
+		// postgres:17-alpine's default collation compares like C under musl,
+		// so ICU's en-US stands in for a database whose default does not. The
+		// queries order by COLLATE "C" themselves.
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE `+ObjectsTable+` ALTER COLUMN "key" TYPE text COLLATE "en-US-x-icu"`); err != nil {
+			t.Skipf("this PostgreSQL has no ICU collation: %v", err)
+		}
+		var first string
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT "key" FROM `+ObjectsTable+
+			` WHERE starts_with("key", 'o/') ORDER BY "key" LIMIT 1`).Scan(&first))
+		require.Equal(t, "o/a", first, "en-US-x-icu orders the column like a language")
+
+		// A new pool: the old one's prepared statements describe the column
+		// as it was.
+		fresh, err := sql.Open("pgx", os.Getenv("TEST_DATABASE_URL"))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = fresh.Close() })
+		b := newBucket(t, fresh)
+		assert.Equal(t, flat, list(b, ""))
+		assert.Equal(t, delimited, list(b, "/"))
+	})
+}
+
+// waitForLockWaiter returns once a statement on the test database waits for
+// a lock.
+func waitForLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		require.NoError(t, db.QueryRowContext(context.Background(), `SELECT count(*) FROM pg_stat_activity
+WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting))
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no statement began to wait for the row lock")
+}
+
+func TestWritesWhenTheDefaultIsRepeatableRead(t *testing.T) {
+	db := testDB(t)
+	reset(t, db)
+	ctx := context.Background()
+
+	// A database or role may set default_transaction_isolation to repeatable
+	// read. The writer, Delete and Copy ask for READ COMMITTED themselves, so
+	// a change that another transaction commits while they wait is no
+	// serialization failure.
+	rr, err := sql.Open("pgx", dsnWith(t, "default_transaction_isolation=repeatable%20read"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rr.Close() })
+	var isolation string
+	require.NoError(t, rr.QueryRowContext(ctx, `SHOW default_transaction_isolation`).Scan(&isolation))
+	require.Equal(t, "repeatable read", isolation)
+	b := newSmallBucket(t, rr)
+
+	// holdRow locks the key's row in another transaction, starts op, waits
+	// until op waits for the lock, and commits a change to the row.
+	holdRow := func(key string, op func() error) error {
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+		_, err = tx.ExecContext(ctx, `UPDATE `+ObjectsTable+` SET mod_time = mod_time WHERE "key" = $1`, key)
+		require.NoError(t, err)
+		done := make(chan error, 1)
+		go func() { done <- op() }()
+		waitForLockWaiter(t, db)
+		require.NoError(t, tx.Commit())
+		return <-done
+	}
+
+	t.Run("a write that commits after another write to its key", func(t *testing.T) {
+		const key = "rr/write"
+		w, err := b.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "text/plain"})
+		require.NoError(t, err)
+		mine := bytes.Repeat([]byte("1"), 10)
+		_, err = w.Write(mine) // one chunk sent: the writer's transaction has its snapshot
+		require.NoError(t, err)
+		require.NoError(t, b.WriteAll(ctx, key, bytes.Repeat([]byte("2"), 12), nil))
+		require.NoError(t, w.Close(), "the write that committed last failed")
+
+		assert.Equal(t, mine, mustRead(t, b, key))
+		rows, size, contents := chunkRows(t, db, key)
+		assert.Equal(t, 2, rows, "the replaced write's chunks were left behind")
+		assert.EqualValues(t, len(mine), size)
+		assert.Equal(t, 1, contents)
+	})
+
+	t.Run("a delete while another transaction changes the row", func(t *testing.T) {
+		const key = "rr/delete"
+		require.NoError(t, b.WriteAll(ctx, key, pattern(20), nil))
+		require.NoError(t, holdRow(key, func() error { return b.Delete(ctx, key) }))
+		_, err := b.Attributes(ctx, key)
+		assert.Equal(t, gcerrors.NotFound, gcerrors.Code(err))
+		rows, _, _ := chunkRows(t, db, key)
+		assert.Zero(t, rows)
+	})
+
+	t.Run("a copy onto a row another transaction changes", func(t *testing.T) {
+		const src, dst = "rr/src", "rr/dst"
+		want := pattern(30)
+		require.NoError(t, b.WriteAll(ctx, src, want, nil))
+		require.NoError(t, b.WriteAll(ctx, dst, []byte("old"), nil))
+		require.NoError(t, holdRow(dst, func() error { return b.Copy(ctx, dst, src, nil) }))
+		assert.Equal(t, want, mustRead(t, b, dst))
+		rows, _, contents := chunkRows(t, db, dst)
+		assert.Equal(t, 5, rows)
+		assert.Equal(t, 1, contents)
+	})
 }

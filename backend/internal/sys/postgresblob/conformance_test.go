@@ -21,11 +21,12 @@ import (
 type conformanceHarness struct {
 	db         *sql.DB
 	chunkSize  int
-	eagerLimit int64
+	shortLimit int64
+	firstFetch int64
 }
 
 func (h *conformanceHarness) MakeDriver(context.Context) (driver.Bucket, error) {
-	return &bucket{db: h.db, chunkSize: h.chunkSize, eagerLimit: h.eagerLimit}, nil
+	return &bucket{db: h.db, chunkSize: h.chunkSize, shortLimit: h.shortLimit, firstFetch: h.firstFetch}, nil
 }
 
 // MakeDriverForNonexistentBucket returns no bucket: a database has no bucket
@@ -54,16 +55,19 @@ var notConformant = map[string]string{
 func TestConformance(t *testing.T) {
 	db := testDB(t)
 
-	// With the real sizes every object of the suite is one chunk read in one
-	// statement; with 7-byte chunks and a 20-byte eager limit the same cases
-	// run through chunked writes and streamed reads.
+	// With the real sizes every object of the suite is one chunk, read in
+	// one or two pieces without a snapshot; with 7-byte chunks, a 20-byte
+	// limit for a read without a snapshot and a 3-byte first piece, the same
+	// cases run through chunked writes, pieces inside a chunk and reads inside
+	// a snapshot.
 	for _, size := range []struct {
 		name       string
 		chunkSize  int
-		eagerLimit int64
+		shortLimit int64
+		firstFetch int64
 	}{
-		{name: "real sizes", chunkSize: ChunkSize, eagerLimit: EagerReadLimit},
-		{name: "small chunks", chunkSize: 7, eagerLimit: 20},
+		{name: "real sizes", chunkSize: ChunkSize, shortLimit: ShortReadLimit, firstFetch: firstFetch},
+		{name: "small chunks", chunkSize: 7, shortLimit: 20, firstFetch: 3},
 	} {
 		t.Run(size.name, func(t *testing.T) {
 			reset(t, db)
@@ -72,7 +76,8 @@ func TestConformance(t *testing.T) {
 				if reason, ok := notConformant[strings.TrimPrefix(t.Name(), prefix)]; ok {
 					t.Skip(reason)
 				}
-				return &conformanceHarness{db: db, chunkSize: size.chunkSize, eagerLimit: size.eagerLimit}, nil
+				return &conformanceHarness{db: db, chunkSize: size.chunkSize, shortLimit: size.shortLimit,
+					firstFetch: size.firstFetch}, nil
 			}, nil)
 		})
 	}
