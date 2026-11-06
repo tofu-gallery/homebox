@@ -68,7 +68,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Production stage
 FROM mirror.gcr.io/library/alpine:latest
 ENV HBOX_MODE=production
-ENV HBOX_STORAGE_CONN_STRING=file:///?no_tmp_dir=true
+# Tofu (2026-11-05): HBOX_STORAGE_CONN_STRING is no longer set here. With a postgres:// DATABASE_URL, the server defaults
+# storage to that PostgreSQL database (postgresblob://), so item photos and attachments survive restarts and deploys; in
+# every other case tofu-entrypoint.sh keeps the old file:/// setting under /data. A value the owner sets always wins.
 ENV HBOX_STORAGE_PREFIX_PATH=data
 ENV HBOX_DATABASE_SQLITE_PATH=/data/homebox.db?_pragma=busy_timeout=2000&_pragma=journal_mode=WAL&_fk=1&_time_format=sqlite
 # Tofu (2026-10-23): thumbnails and the hourly GitHub release check are off by default on Tofu
@@ -76,7 +78,7 @@ ENV HBOX_THUMBNAIL_ENABLED=false
 ENV HBOX_OPTIONS_GITHUB_RELEASE_CHECK=false
 # Tofu (2026-10-23): the sign-in page and footer link to the exact source this image is built from (AGPL-3.0 section 13)
 # Tofu (2026-10-26): the address names this pin's own tag
-ENV HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-10-26.2
+ENV HBOX_OPTIONS_SOURCE_URL=https://github.com/tofu-gallery/homebox/tree/pin/2026-11-06
 
 # Install necessary runtime dependencies
 RUN apk --no-cache add ca-certificates wget mosquitto-clients && \

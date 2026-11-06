@@ -298,6 +298,8 @@ func (ctrl *V1Controller) handleEntityAttachmentsHandler(w http.ResponseWriter, 
 
 		_, serveSpan := startEntityCtrlSpan(getCtx, "controller.V1.handleEntityAttachmentsHandler.serveContent",
 			attribute.String("attachment.disposition", disposition))
+		// Tofu (2026-11-06): a request for several byte ranges gets the whole file (see tofu_ranges.go).
+		tofuIgnoreMultipleRanges(r)
 		http.ServeContent(w, r, doc.Title, doc.CreatedAt, file)
 		serveSpan.End()
 		return nil
